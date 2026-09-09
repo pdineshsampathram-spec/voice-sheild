@@ -61,6 +61,10 @@ class AudioTelemetry:
     first_sample_timestamp: float = 0.0
     last_sample_timestamp: float = 0.0
     resampler_active: bool = False
+    min_val: float = 0.0
+    max_val: float = 0.0
+    mean_val: float = 0.0
+    zero_crossing_rate: float = 0.0
     sequence_counter: int = 0
     vad_probability: float = 0.0
     speech_active: bool = False
@@ -89,6 +93,8 @@ class AudioTrackConsumer:
         self._audio_bus = audio_bus
         self._session_id = session_id
         self._track_id = track_id or getattr(track, 'id', "track_live")
+        self._track_source = track_source
+        self._track_direction = track_direction
         self._telemetry = AudioTelemetry(
             session_id=session_id,
             room_id=room_id,
@@ -171,25 +177,48 @@ class AudioTrackConsumer:
 
                 self._telemetry.frames_decoded += 1
 
-                # Convert av.AudioFrame to numpy array
-                # frame.to_ndarray() returns shape (channels, samples) as int16 or float
+                # Convert av.AudioFrame to numpy array and extract mono float32
                 raw_array = frame.to_ndarray()
+                orig_dtype = raw_array.dtype
+                n_channels = len(frame.layout.channels) if frame.layout else 1
+                format_name = frame.format.name
 
-                # Handle multi-channel → mono
-                if raw_array.ndim == 2 and raw_array.shape[0] > 1:
-                    raw_array = raw_array.mean(axis=0)
-                elif raw_array.ndim == 2:
-                    raw_array = raw_array[0]
-
-                # Convert to float32 [-1, 1]
-                if raw_array.dtype == np.int16:
-                    audio_float = raw_array.astype(np.float32) / 32768.0
-                elif raw_array.dtype == np.int32:
-                    audio_float = raw_array.astype(np.float32) / 2147483648.0
-                elif raw_array.dtype == np.float32:
-                    audio_float = raw_array
+                if n_channels > 1:
+                    if 'p' in format_name:
+                        # Planar: shape is (channels, samples)
+                        ch_rms = np.sqrt(np.mean(raw_array.astype(np.float64) ** 2, axis=1))
+                        if ch_rms[0] > 1e-4 and ch_rms[1] < 1e-5:
+                            mono = raw_array[0]
+                        elif ch_rms[1] > 1e-4 and ch_rms[0] < 1e-5:
+                            mono = raw_array[1]
+                        else:
+                            mono = raw_array.mean(axis=0)
+                    else:
+                        # Interleaved: shape is (1, samples * n_channels)
+                        samples = frame.samples
+                        reshaped = raw_array.reshape(samples, n_channels)
+                        ch_rms = np.sqrt(np.mean(reshaped.astype(np.float64) ** 2, axis=0))
+                        if ch_rms[0] > 1e-4 and ch_rms[1] < 1e-5:
+                            mono = reshaped[:, 0]
+                        elif ch_rms[1] > 1e-4 and ch_rms[0] < 1e-5:
+                            mono = reshaped[:, 1]
+                        else:
+                            mono = reshaped.mean(axis=1)
                 else:
-                    audio_float = raw_array.astype(np.float32)
+                    if raw_array.ndim == 2:
+                        mono = raw_array[0]
+                    else:
+                        mono = raw_array
+
+                # Convert to float32 [-1, 1] based on original integer dtype
+                if orig_dtype == np.int16:
+                    audio_float = mono.astype(np.float32) / 32768.0
+                elif orig_dtype == np.int32:
+                    audio_float = mono.astype(np.float32) / 2147483648.0
+                elif orig_dtype == np.uint8:
+                    audio_float = (mono.astype(np.float32) - 128.0) / 128.0
+                else:
+                    audio_float = mono.astype(np.float32)
 
                 tensor = torch.from_numpy(audio_float)
 
@@ -205,6 +234,14 @@ class AudioTrackConsumer:
                     self._telemetry.peak = float(torch.max(abs_tensor))
                     zero_count = int(torch.sum(abs_tensor < 1e-6))
                     self._telemetry.zero_percentage = zero_count / len(tensor) * 100
+                    self._telemetry.min_val = float(torch.min(tensor))
+                    self._telemetry.max_val = float(torch.max(tensor))
+                    self._telemetry.mean_val = float(torch.mean(tensor))
+                    if len(tensor) > 1:
+                        signs = torch.sign(tensor)
+                        self._telemetry.zero_crossing_rate = float(
+                            torch.mean(torch.abs(signs[1:] - signs[:-1])) / 2.0
+                        )
 
                 # Publish to audio bus with canonical timeline metadata
                 await self._audio_bus.publish(
@@ -213,7 +250,7 @@ class AudioTrackConsumer:
                     session_id=self._session_id,
                     track_id=self._track_id,
                     track_source=self._telemetry.track_source,
-                    track_direction=self._track_direction,
+                    track_direction=self._telemetry.track_direction,
                 )
 
             except asyncio.CancelledError:
@@ -374,6 +411,10 @@ class WebRTCMediaReceiver:
             "current_rms": round(t.rms, 6),
             "peak": round(t.peak, 6),
             "current_peak": round(t.peak, 6),
+            "min_val": round(t.min_val, 6),
+            "max_val": round(t.max_val, 6),
+            "mean_val": round(t.mean_val, 6),
+            "zero_crossing_rate": round(t.zero_crossing_rate, 4),
             "zero_pct": round(t.zero_percentage, 2),
             "first_sample_timestamp": t.first_sample_timestamp,
             "last_sample_timestamp": t.last_sample_timestamp,
