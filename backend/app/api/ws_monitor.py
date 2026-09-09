@@ -33,11 +33,19 @@ router = APIRouter(prefix="/api/monitor", tags=["Monitor"])
 
 class CreateSessionRequest(BaseModel):
     asr_model_size: str = "base"
+    room_id: Optional[str] = None
+    observed_peer_id: Optional[str] = None
+    track_id: Optional[str] = None
+    track_source: str = "LOCAL_MIC"  # "LOCAL_MIC" or "REMOTE_PEER"
+    track_direction: str = "inbound"  # "inbound" or "outbound"
+    connection_generation: int = 1
 
 
 class CreateSessionResponse(BaseModel):
     session_id: str
     status: str
+    track_id: str
+    track_source: str
 
 
 class SDPOfferRequest(BaseModel):
@@ -77,13 +85,26 @@ async def create_monitor_session(req: CreateSessionRequest = CreateSessionReques
     """Create a new monitor session with all pipelines."""
     try:
         asr = _get_or_create_asr(req.asr_model_size)
-        session = create_session(asr_model_size=req.asr_model_size)
+        session = create_session(
+            asr_model_size=req.asr_model_size,
+            room_id=req.room_id,
+            observed_peer_id=req.observed_peer_id,
+            track_id=req.track_id,
+            track_source=req.track_source,
+            track_direction=req.track_direction,
+            connection_generation=req.connection_generation,
+        )
         await session.start(asr_provider=asr)
 
-        logger.info(f"Monitor session created: {session.session_id}")
+        logger.info(
+            f"Monitor session created: {session.session_id} "
+            f"(track={session.track_id}, source={session.track_source}, room={session.room_id})"
+        )
         return CreateSessionResponse(
             session_id=session.session_id,
             status="started",
+            track_id=session.track_id,
+            track_source=session.track_source,
         )
     except Exception as e:
         logger.error(f"Failed to create session: {e}", exc_info=True)

@@ -170,8 +170,53 @@ class HFWhisperProvider(ASRProvider):
                     log_prob_threshold=self._log_prob_threshold,
                     compression_ratio_threshold=2.4,
                 )
-                parts = [s.text.strip() for s in segments if s.text and s.text.strip()]
-                text = " ".join(parts).strip()
+                valid_parts = []
+                avg_logprob_sum = 0.0
+                max_no_speech_prob = 0.0
+                segment_count = 0
+
+                FORBIDDEN_HALLUCINATIONS = {
+                    "i'll see you in the next video",
+                    "see you in the next video",
+                    "thank you for watching",
+                    "thanks for watching",
+                    "don't forget to subscribe",
+                    "please subscribe",
+                    "amen",
+                    "subtitles by",
+                    "english subtitles",
+                    "closed captioning provided by",
+                    "transcription by",
+                }
+
+                for s in segments:
+                    segment_count += 1
+                    s_text = s.text.strip()
+                    s_no_speech = getattr(s, "no_speech_prob", 0.0)
+                    s_avg_logprob = getattr(s, "avg_logprob", 0.0)
+                    avg_logprob_sum += s_avg_logprob
+                    max_no_speech_prob = max(max_no_speech_prob, s_no_speech)
+
+                    # Hallucination filter: high no_speech_prob or poor acoustic likelihood
+                    if s_no_speech > 0.45:
+                        logger.debug(f"[ASR Defense] Rejected segment '{s_text}': high no_speech_prob={s_no_speech:.3f}")
+                        continue
+                    if s_avg_logprob < -1.1:
+                        logger.debug(f"[ASR Defense] Rejected segment '{s_text}': low avg_logprob={s_avg_logprob:.3f}")
+                        continue
+
+                    # Filter known training priors (e.g. YouTube outro boilerplate)
+                    clean_lower = s_text.lower().strip(" .!?,;:")
+                    if clean_lower in FORBIDDEN_HALLUCINATIONS and (s_avg_logprob < -0.4 or s_no_speech > 0.2):
+                        logger.info(f"[ASR Defense] Filtered YouTube/training prior hallucination: '{s_text}'")
+                        continue
+
+                    if s_text:
+                        valid_parts.append(s_text)
+
+                text = " ".join(valid_parts).strip()
+                avg_logprob = (avg_logprob_sum / segment_count) if segment_count > 0 else 0.0
+                no_speech_prob = max_no_speech_prob
                 if info and info.language:
                     detected_language = info.language
 
@@ -182,11 +227,13 @@ class HFWhisperProvider(ASRProvider):
             text=text,
             is_partial=False,
             language=detected_language,
-            confidence=0.0,
+            confidence=round(1.0 - no_speech_prob, 3),
             latency_ms=latency_ms,
             sample_start=sample_offset,
             sample_end=sample_offset + len(audio_np),
             model_name=f"hf-whisper-{self._model_name}-{self._backend}",
+            avg_logprob=round(avg_logprob, 3),
+            no_speech_prob=round(no_speech_prob, 3),
         )
 
     def get_model_info(self) -> ASRModelInfo:

@@ -39,9 +39,18 @@ CANONICAL_CHANNELS = 1
 
 @dataclass
 class AudioTelemetry:
-    """Real-time telemetry from the WebRTC audio ingest."""
+    """Real-time telemetry and ground truth from the WebRTC audio ingest."""
+    session_id: str = ""
+    room_id: Optional[str] = None
+    observed_peer_id: Optional[str] = None
+    track_id: str = "unknown"
+    track_kind: str = "audio"
+    track_direction: str = "inbound"
+    track_source: str = "LOCAL_MIC"  # "LOCAL_MIC" or "REMOTE_PEER"
+    connection_generation: int = 1
     negotiated_codec: str = "unknown"
     source_sample_rate: int = 0
+    canonical_sample_rate: int = CANONICAL_SAMPLE_RATE
     source_channels: int = 0
     packets_received: int = 0
     frames_decoded: int = 0
@@ -49,8 +58,10 @@ class AudioTelemetry:
     rms: float = 0.0
     peak: float = 0.0
     zero_percentage: float = 0.0
-    last_frame_time: float = 0.0
+    first_sample_timestamp: float = 0.0
+    last_sample_timestamp: float = 0.0
     resampler_active: bool = False
+    sequence_counter: int = 0
 
 
 class AudioTrackConsumer:
@@ -60,10 +71,32 @@ class AudioTrackConsumer:
     Records all telemetry without assuming codec or sample rate.
     """
 
-    def __init__(self, track: MediaStreamTrack, audio_bus: AudioBus):
+    def __init__(
+        self,
+        track: MediaStreamTrack,
+        audio_bus: AudioBus,
+        session_id: str = "",
+        room_id: Optional[str] = None,
+        observed_peer_id: Optional[str] = None,
+        track_id: str = "",
+        track_source: str = "LOCAL_MIC",
+        track_direction: str = "inbound",
+        connection_generation: int = 1,
+    ):
         self._track = track
         self._audio_bus = audio_bus
-        self._telemetry = AudioTelemetry()
+        self._session_id = session_id
+        self._track_id = track_id or getattr(track, 'id', "track_live")
+        self._telemetry = AudioTelemetry(
+            session_id=session_id,
+            room_id=room_id,
+            observed_peer_id=observed_peer_id,
+            track_id=self._track_id,
+            track_kind=getattr(track, 'kind', 'audio'),
+            track_direction=track_direction,
+            track_source=track_source,
+            connection_generation=connection_generation,
+        )
         self._resampler: Optional[torchaudio.transforms.Resample] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -76,7 +109,7 @@ class AudioTrackConsumer:
         """Start consuming audio frames from the track."""
         self._running = True
         self._task = asyncio.create_task(self._consume_loop())
-        logger.info("AudioTrackConsumer started")
+        logger.info(f"AudioTrackConsumer started for track {self._track_id} (source: {self._telemetry.track_source})")
 
     async def stop(self):
         """Stop consuming."""
@@ -88,7 +121,7 @@ class AudioTrackConsumer:
             except asyncio.CancelledError:
                 pass
         logger.info(
-            f"AudioTrackConsumer stopped. "
+            f"AudioTrackConsumer stopped for track {self._track_id}. "
             f"Frames decoded: {self._telemetry.frames_decoded}, "
             f"Samples: {self._telemetry.total_samples_decoded}"
         )
@@ -100,11 +133,13 @@ class AudioTrackConsumer:
                 # aiortc MediaStreamTrack.recv() returns an AudioFrame (av.AudioFrame)
                 frame = await self._track.recv()
 
+                now = time.time()
                 self._telemetry.packets_received += 1
-                self._telemetry.last_frame_time = time.time()
+                self._telemetry.last_sample_timestamp = now
 
                 # Inspect actual format on first frame
                 if self._telemetry.frames_decoded == 0:
+                    self._telemetry.first_sample_timestamp = now
                     self._telemetry.source_sample_rate = frame.sample_rate
                     self._telemetry.source_channels = len(frame.layout.channels) if frame.layout else 1
                     self._telemetry.negotiated_codec = getattr(
@@ -112,7 +147,8 @@ class AudioTrackConsumer:
                     )
 
                     logger.info(
-                        f"WebRTC audio: first frame received — "
+                        f"WebRTC audio: first frame received for track {self._track_id} — "
+                        f"source={self._telemetry.track_source}, "
                         f"sample_rate={frame.sample_rate}, "
                         f"channels={self._telemetry.source_channels}, "
                         f"format={frame.format.name}, "
@@ -168,10 +204,12 @@ class AudioTrackConsumer:
                     zero_count = int(torch.sum(abs_tensor < 1e-6))
                     self._telemetry.zero_percentage = zero_count / len(tensor) * 100
 
-                # Publish to audio bus
+                # Publish to audio bus with canonical timeline metadata
                 await self._audio_bus.publish(
                     samples=tensor,
-                    wall_timestamp=time.time(),
+                    wall_timestamp=now,
+                    session_id=self._session_id,
+                    track_id=self._track_id,
                 )
 
             except asyncio.CancelledError:
@@ -186,14 +224,31 @@ class WebRTCMediaReceiver:
     """Server-side WebRTC peer that terminates media and extracts audio.
 
     Usage:
-        receiver = WebRTCMediaReceiver(audio_bus)
+        receiver = WebRTCMediaReceiver(audio_bus, session_id=..., track_source=...)
         answer_sdp = await receiver.handle_offer(offer_sdp)
         # Audio now flows into audio_bus
         await receiver.close()
     """
 
-    def __init__(self, audio_bus: AudioBus):
+    def __init__(
+        self,
+        audio_bus: AudioBus,
+        session_id: str = "",
+        room_id: Optional[str] = None,
+        observed_peer_id: Optional[str] = None,
+        track_id: str = "",
+        track_source: str = "LOCAL_MIC",
+        track_direction: str = "inbound",
+        connection_generation: int = 1,
+    ):
         self._audio_bus = audio_bus
+        self._session_id = session_id
+        self._room_id = room_id
+        self._observed_peer_id = observed_peer_id
+        self._track_id = track_id
+        self._track_source = track_source
+        self._track_direction = track_direction
+        self._connection_generation = connection_generation
         self._pc: Optional[RTCPeerConnection] = None
         self._consumer: Optional[AudioTrackConsumer] = None
         self._relay = MediaRelay()
@@ -230,19 +285,27 @@ class WebRTCMediaReceiver:
 
         @self._pc.on("track")
         async def on_track(track: MediaStreamTrack):
-            logger.info(f"WebRTC track received: kind={track.kind}")
+            actual_track_id = self._track_id or getattr(track, 'id', 'track_live')
+            logger.info(f"WebRTC track received: kind={track.kind}, id={actual_track_id}, source={self._track_source}")
 
             if track.kind == "audio":
                 # Create consumer for this audio track
                 self._consumer = AudioTrackConsumer(
                     track=track,
                     audio_bus=self._audio_bus,
+                    session_id=self._session_id,
+                    room_id=self._room_id,
+                    observed_peer_id=self._observed_peer_id,
+                    track_id=actual_track_id,
+                    track_source=self._track_source,
+                    track_direction=self._track_direction,
+                    connection_generation=self._connection_generation,
                 )
                 await self._consumer.start()
 
                 @track.on("ended")
                 async def on_track_ended():
-                    logger.info("WebRTC audio track ended")
+                    logger.info(f"WebRTC audio track {actual_track_id} ended")
                     if self._consumer:
                         await self._consumer.stop()
 
@@ -267,13 +330,30 @@ class WebRTCMediaReceiver:
         logger.info("WebRTCMediaReceiver closed")
 
     def get_telemetry_dict(self) -> dict:
-        """Get telemetry for UI display."""
+        """Get telemetry for UI display and live audio truth panel."""
         if not self._consumer:
-            return {"status": "no_track"}
+            return {
+                "status": "no_track",
+                "session_id": self._session_id,
+                "room_id": self._room_id,
+                "observed_peer_id": self._observed_peer_id,
+                "track_id": self._track_id,
+                "track_source": self._track_source,
+                "track_direction": self._track_direction,
+                "connection_generation": self._connection_generation,
+            }
 
         t = self._consumer.telemetry
         return {
             "status": "receiving" if self._connected else "disconnected",
+            "session_id": t.session_id,
+            "room_id": t.room_id,
+            "observed_peer_id": t.observed_peer_id,
+            "track_id": t.track_id,
+            "track_kind": t.track_kind,
+            "track_direction": t.track_direction,
+            "track_source": t.track_source,
+            "connection_generation": t.connection_generation,
             "codec": t.negotiated_codec,
             "source_sample_rate": t.source_sample_rate,
             "source_channels": t.source_channels,
@@ -287,5 +367,7 @@ class WebRTCMediaReceiver:
             "rms": round(t.rms, 6),
             "peak": round(t.peak, 6),
             "zero_pct": round(t.zero_percentage, 2),
+            "first_sample_timestamp": t.first_sample_timestamp,
+            "last_sample_timestamp": t.last_sample_timestamp,
             "resampler_active": t.resampler_active,
         }

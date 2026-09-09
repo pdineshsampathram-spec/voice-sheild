@@ -168,6 +168,34 @@ class RiskEngine:
         Uses temporal state: rolling window average, consecutive elevated
         counts, and debounce logic to stabilize decisions.
         """
+        # Quality Gate / Silence Abstention: do not pollute rolling history with non-speech
+        if (
+            getattr(spoof, "label", "") in ("abstain", "unavailable", "invalid")
+            or (spoof.spoof_score == 0.0 and getattr(spoof, "raw_logit_spoof", 0.0) == 0.0)
+        ):
+            avg_spoof = (
+                sum(self._spoof_history) / len(self._spoof_history)
+                if self._spoof_history
+                else 0.0
+            )
+            return RiskAssessment(
+                risk_score=round(avg_spoof, 4),
+                risk_level=self._current_level,
+                decision=self._level_to_decision(self._current_level),
+                reason="Audio energy below speech threshold (silence/abstain); maintaining baseline.",
+                spoof_score_avg=round(avg_spoof, 4),
+                speaker_similarity_avg=(
+                    sum(self._speaker_history) / len(self._speaker_history)
+                    if self._speaker_history
+                    else None
+                ),
+                window_count=len(self._spoof_history),
+                suspicious_window_count=sum(
+                    1 for s in self._spoof_history if s >= settings.spoof_threshold_medium
+                ),
+                temporal_consistency=0.0,
+            )
+
         # Add to history
         self._spoof_history.append(spoof.spoof_score)
         if speaker is not None:

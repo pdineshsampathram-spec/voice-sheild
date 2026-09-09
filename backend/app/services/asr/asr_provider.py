@@ -26,6 +26,8 @@ class ASRResult:
     sample_start: int = 0          # Absolute sample position
     sample_end: int = 0            # Absolute sample position
     model_name: str = "unknown"
+    avg_logprob: float = 0.0       # Average logprob of decoded tokens
+    no_speech_prob: float = 0.0    # Probability that segment contains no speech
 
     @property
     def duration_seconds(self) -> float:

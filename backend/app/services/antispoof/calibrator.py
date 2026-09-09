@@ -249,7 +249,7 @@ class ScoreCalibrator:
                 calibration_method=self.method,
                 operating_threshold=round(self.operating_threshold, 4) if self.is_loaded else None,
                 target_domain=self.domain,
-                is_valid=True,
+                is_valid=False,
                 invalidation_reason=f"QUALITY_GATE: Low RMS ({rms:.5f} < {gate_rms:.4f})",
             )
 

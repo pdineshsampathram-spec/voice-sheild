@@ -199,3 +199,112 @@ def test_caption_event_lineage_fields():
     assert event.asr_backend == "ctranslate2"
     assert event.caption_start == 0
     assert event.caption_end == 16000
+
+
+def test_silence_aasist_contradiction_gated():
+    """Verify Phase 3 & 14 invariant: Low-energy audio (RMS ~0.001) MUST NOT run AASIST or emit spoof scores."""
+    import asyncio
+    from app.services.monitor.audio_bus import AudioBus
+    from app.services.monitor.security_pipeline import SecurityPipeline, DetectionEvent, ProtectionDecision
+
+    async def _test():
+        bus = AudioBus()
+        queue = bus.subscribe("sec_test")
+        events = []
+
+        pipeline = SecurityPipeline(
+            audio_queue=queue,
+            on_event=lambda e: events.append(e),
+            session_id="test_sess_123",
+            track_id="test_track_456",
+        )
+        pipeline._load_vad()
+
+        # Generate 64600 samples of low-energy background noise (RMS ~0.001)
+        silence_window = torch.randn(64600) * 0.001
+        silence_rms = float(torch.sqrt(torch.mean(silence_window ** 2)))
+        assert silence_rms < 0.002, f"Noise too loud: {silence_rms}"
+
+        # Manually execute _analyze_window
+        await pipeline._analyze_window(silence_window, window_start=0, window_valid=True, invalidation_reason="")
+
+        # Verify that AASIST was gated: detection must be ABSTAIN with spoof_score 0.0
+        detections = [e for e in events if isinstance(e, DetectionEvent)]
+        assert len(detections) == 1, "Expected 1 DetectionEvent"
+        det = detections[0]
+        assert det.decision == "ABSTAIN", f"Expected ABSTAIN on silence, got {det.decision}"
+        assert det.spoof_score == 0.0, f"Expected spoof_score 0.0 on silence, got {det.spoof_score}"
+        assert det.window_valid is False, "Expected window_valid False on silence"
+        assert "SILENCE_NO_SPEECH" in det.invalidation_reason
+
+        # Verify ProtectionDecision emitted with quality_status SILENCE_NO_SPEECH
+        decisions = [e for e in events if isinstance(e, ProtectionDecision)]
+        assert len(decisions) == 1, "Expected 1 ProtectionDecision"
+        dec = decisions[0]
+        assert dec.quality_status == "SILENCE_NO_SPEECH"
+        assert dec.decision == "INSUFFICIENT_EVIDENCE"
+
+    asyncio.run(_test())
+
+
+def test_audio_bus_canonical_timeline_and_track_lineage():
+    """Verify Phase 1 & 4 invariant: Every audio chunk carries proven track identity and timeline continuity."""
+    import asyncio
+    from app.services.monitor.audio_bus import AudioBus
+
+    async def _test():
+        bus = AudioBus()
+        q = bus.subscribe("test_sub")
+
+        chunk_1 = torch.zeros(960)
+        await bus.publish(
+            chunk_1,
+            session_id="sess_abc",
+            track_id="track_remote_01",
+            track_source="REMOTE_PEER",
+            track_direction="inbound",
+        )
+
+        chunk_2 = torch.zeros(960)
+        await bus.publish(
+            chunk_2,
+            session_id="sess_abc",
+            track_id="track_remote_01",
+            track_source="REMOTE_PEER",
+            track_direction="inbound",
+        )
+
+        c1 = q._queue.get_nowait()
+        c2 = q._queue.get_nowait()
+
+        assert c1.session_id == "sess_abc"
+        assert c1.track_id == "track_remote_01"
+        assert c1.track_source == "REMOTE_PEER"
+        assert c1.track_direction == "inbound"
+        assert c1.sample_start == 0
+        assert c1.sample_end == 960
+        assert c1.sequence_id == 0
+
+        assert c2.session_id == "sess_abc"
+        assert c2.track_id == "track_remote_01"
+        assert c2.sample_start == 960
+        assert c2.sample_end == 1920
+        assert c2.sequence_id == 1
+
+    asyncio.run(_test())
+
+
+def test_hf_whisper_youtube_hallucination_gating():
+    """Verify Phase 7: Training prior artifacts like 'Amen' and 'I'll see you in the next video' are rejected on low energy."""
+    provider = HFWhisperProvider(model_name="base")
+    loaded = provider.load_model()
+    if not loaded:
+        pytest.skip("Whisper model not available")
+
+    # Near-silent audio snippet (500ms of 0.0005 RMS)
+    low_energy = torch.randn(8000) * 0.0005
+    res = provider.transcribe_segment(low_energy, sample_offset=0)
+
+    # Must be cleanly suppressed to empty string
+    assert res.text == "", f"Expected empty text on sub-threshold audio, got '{res.text}'"
+

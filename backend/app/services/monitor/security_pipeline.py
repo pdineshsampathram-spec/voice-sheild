@@ -27,6 +27,8 @@ import numpy as np
 
 from app.services.monitor.audio_bus import ConsumerQueue, AudioChunk, DiscontinuityEvent
 from app.services.antispoof.calibrator import score_calibrator, CalibratedOutput
+from app.schemas.analysis import SpoofResult
+from app.services.risk.risk_engine import RiskEngine
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,8 @@ VAD_FRAME_SAMPLES = 512             # 32ms at 16kHz for Silero VAD
 class DetectionEvent:
     """Anti-spoof detection event from a single AASIST window."""
     type: str = "detection"
+    session_id: str = ""
+    track_id: str = ""
     window_index: int = 0
     sample_start: int = 0
     sample_end: int = 0
@@ -54,14 +58,14 @@ class DetectionEvent:
 
     # Calibrated probability and decision (Strict distinction)
     calibrated_probability: Optional[float] = None  # None when uncalibrated
-    decision: str = "UNCALIBRATED"                   # "UNCALIBRATED", "GENUINE", "SUSPICIOUS", "INVALID"
-    calibration_status: str = "CALIBRATION_REQUIRED" # "CALIBRATION_REQUIRED", "CALIBRATED", "INVALID_WINDOW"
+    decision: str = "UNCALIBRATED"                   # "UNCALIBRATED", "GENUINE", "SUSPICIOUS", "INVALID", "ABSTAIN"
+    calibration_status: str = "CALIBRATION_REQUIRED" # "CALIBRATION_REQUIRED", "CALIBRATED", "INVALID_WINDOW", "INSUFFICIENT_AUDIO_QUALITY"
     calibration_version: str = "none"
     calibration_method: str = "none"
     operating_threshold: Optional[float] = None
     target_domain: str = "webrtc_opus"
 
-    # Window validity — set to False on audio discontinuity
+    # Window validity — set to False on silence or audio discontinuity
     window_valid: bool = True
     invalidation_reason: str = ""
 
@@ -70,6 +74,8 @@ class DetectionEvent:
 class SpeakerEvent:
     """Speaker verification event from ECAPA (Kept strictly separate from spoofing)."""
     type: str = "speaker"
+    session_id: str = ""
+    track_id: str = ""
     sample_start: int = 0
     sample_end: int = 0
     embedding_dim: int = 192
@@ -84,10 +90,33 @@ class SpeakerEvent:
 class WindowProgress:
     """Progress toward the next AASIST window."""
     type: str = "window_progress"
+    session_id: str = ""
+    track_id: str = ""
     samples_collected: int = 0
     samples_needed: int = AASIST_WINDOW_SAMPLES
     progress_pct: float = 0.0
     next_window_index: int = 0
+
+
+@dataclass
+class ProtectionDecision:
+    """Consolidated protection decision emitted by the backend security pipeline.
+
+    Frontend renders this as single source of truth — never recalculates spoof risk.
+    """
+    type: str = "protection_decision"
+    session_id: str = ""
+    track_id: str = ""
+    decision: str = "INSUFFICIENT_EVIDENCE"  # "SAFE", "MONITOR", "WARN", "VERIFY", "BLOCK", "INSUFFICIENT_EVIDENCE", "ABSTAIN"
+    risk_level: str = "LOW"                 # "LOW", "MEDIUM", "HIGH", "CRITICAL"
+    reason: str = ""
+    evidence_ids: list[str] = field(default_factory=list)
+    timestamp: float = 0.0
+    quality_status: str = "OK"              # "OK", "SILENCE_NO_SPEECH", "AUDIO_DISCONTINUITY", "INSUFFICIENT_AUDIO_QUALITY"
+    calibration_status: str = "CALIBRATION_REQUIRED"
+    window_count: int = 0
+    suspicious_count: int = 0
+    spoof_score_avg: float = 0.0
 
 
 class SecurityPipeline:
@@ -102,10 +131,21 @@ class SecurityPipeline:
         audio_queue: ConsumerQueue,
         on_event: Callable,
         executor: Optional[ThreadPoolExecutor] = None,
+        session_id: str = "",
+        track_id: str = "",
     ):
         self._queue = audio_queue
         self._on_event = on_event
         self._executor = executor or ThreadPoolExecutor(max_workers=1)
+        self._session_id = session_id
+        self._track_id = track_id
+
+        # Risk Decision Engine & Evidence Registry
+        self._risk_engine = RiskEngine()
+        self._evidence_ids: list[str] = []
+        self._valid_windows_count = 0
+        self._suspicious_windows_count = 0
+        self._current_protection_decision = "INSUFFICIENT_EVIDENCE"
 
         # VAD state — independent instance for ECAPA speech gating
         self._vad_model = None
@@ -234,6 +274,8 @@ class SecurityPipeline:
             # Emit progress toward next AASIST window
             progress = len(self._buffer) / AASIST_WINDOW_SAMPLES * 100
             self._on_event(WindowProgress(
+                session_id=self._session_id,
+                track_id=self._track_id,
                 samples_collected=len(self._buffer),
                 samples_needed=AASIST_WINDOW_SAMPLES,
                 progress_pct=min(progress, 100.0),
@@ -298,7 +340,72 @@ class SecurityPipeline:
             # Compute window acoustic energy
             window_rms = float(torch.sqrt(torch.mean(window ** 2)))
 
-            # Run raw model inference in thread pool
+            # Evaluate VAD speech frames across window (126 frames of 512 samples)
+            speech_frames = 0
+            total_frames = len(window) // VAD_FRAME_SAMPLES
+            if self._vad_loaded and total_frames > 0:
+                for i in range(total_frames):
+                    f = window[i * VAD_FRAME_SAMPLES:(i + 1) * VAD_FRAME_SAMPLES]
+                    try:
+                        if self._vad_model(f, 16000).item() > 0.5:
+                            speech_frames += 1
+                    except Exception:
+                        pass
+                speech_ratio = speech_frames / total_frames
+            else:
+                speech_ratio = 1.0 if window_rms >= 0.003 else 0.0
+
+            is_silence = (window_rms < 0.003) or (speech_ratio < 0.10)
+
+            # ZERO-TRUST SILENCE GUARD: If window contains silence or no speech,
+            # DO NOT run AASIST (which yields erratic ~0.98 logits on empty audio).
+            if is_silence:
+                self._windows_processed += 1
+                self._windows_abstained += 1
+                silence_reason = f"SILENCE_NO_SPEECH (RMS={window_rms:.5f}, speech={speech_ratio:.1%})"
+                logger.info(
+                    f"[LIVE TRACE: WIN-{self._window_index}] AUDIO: samples=[{window_start}..{window_start + AASIST_WINDOW_SAMPLES}] "
+                    f"RMS={window_rms:.5f} speech={speech_ratio:.1%} | AASIST: ABSTAIN (silence/no speech) | track={self._track_id}"
+                )
+                self._on_event(DetectionEvent(
+                    session_id=self._session_id,
+                    track_id=self._track_id,
+                    window_index=self._window_index,
+                    sample_start=window_start,
+                    sample_end=window_start + AASIST_WINDOW_SAMPLES,
+                    latency_ms=0.0,
+                    raw_logit_spoof=0.0,
+                    raw_logit_bonafide=0.0,
+                    spoof_score=0.0,
+                    bonafide_score=0.0,
+                    model="Spectra-AASIST",
+                    calibrated_probability=None,
+                    decision="ABSTAIN",
+                    calibration_status="INSUFFICIENT_AUDIO_QUALITY",
+                    calibration_version=score_calibrator.version,
+                    calibration_method=score_calibrator.method,
+                    operating_threshold=score_calibrator.operating_threshold if score_calibrator.is_loaded else None,
+                    target_domain=score_calibrator.domain,
+                    window_valid=False,
+                    invalidation_reason=silence_reason,
+                ))
+                self._on_event(ProtectionDecision(
+                    session_id=self._session_id,
+                    track_id=self._track_id,
+                    decision=self._current_protection_decision if self._valid_windows_count > 0 else "INSUFFICIENT_EVIDENCE",
+                    risk_level=self._risk_engine._current_level.value,
+                    reason=f"Window #{self._window_index} below speech threshold (silence/ambient noise).",
+                    evidence_ids=list(self._evidence_ids),
+                    timestamp=time.time(),
+                    quality_status="SILENCE_NO_SPEECH",
+                    calibration_status="INSUFFICIENT_AUDIO_QUALITY",
+                    window_count=self._valid_windows_count,
+                    suspicious_count=self._suspicious_windows_count,
+                    spoof_score_avg=round(sum(self._risk_engine._spoof_history) / len(self._risk_engine._spoof_history), 4) if self._risk_engine._spoof_history else 0.0,
+                ))
+                return
+
+            # Run raw model inference in thread pool only on validated speech windows
             start_time = time.time()
             result = await loop.run_in_executor(
                 self._executor,
@@ -321,16 +428,36 @@ class SecurityPipeline:
             if calibrated.decision == "ABSTAIN":
                 self._windows_abstained += 1
 
+            # Assess risk using RiskEngine for temporal consistency and hysteresis
+            spoof_res = SpoofResult(
+                model="Spectra-AASIST",
+                label="spoof" if calibrated.raw_spoof_score >= 0.5 else "bonafide",
+                spoof_score=calibrated.raw_spoof_score,
+                bonafide_score=result.bonafide_score,
+                raw_logit_spoof=calibrated.raw_logit_spoof,
+                raw_logit_bonafide=calibrated.raw_logit_bonafide,
+            )
+            assessment = self._risk_engine.assess_live_window(spoof_res)
+            self._valid_windows_count += 1
+            win_id = f"win_{self._window_index}"
+            self._evidence_ids.append(win_id)
+            if calibrated.decision == "SUSPICIOUS":
+                self._suspicious_windows_count += 1
+
+            self._current_protection_decision = assessment.decision.value
+
             logger.info(
                 f"[LIVE TRACE: WIN-{self._window_index}] AUDIO: samples=[{window_start}..{window_start + AASIST_WINDOW_SAMPLES}] "
-                f"({AASIST_WINDOW_SAMPLES/16000:.2f}s) RMS={window_rms:.5f} | "
+                f"({AASIST_WINDOW_SAMPLES/16000:.2f}s) RMS={window_rms:.5f} speech={speech_ratio:.1%} | "
                 f"AASIST: model={result.model} logit_spoof={calibrated.raw_logit_spoof:.4f} "
                 f"logit_bonafide={calibrated.raw_logit_bonafide:.4f} spoof_score={calibrated.raw_spoof_score:.4f} "
                 f"valid={calibrated.is_valid} | DECISION: {calibrated.decision} ({calibrated.calibration_status}) "
-                f"latency={latency_ms:.1f}ms"
+                f"risk={assessment.decision.value} latency={latency_ms:.1f}ms | track={self._track_id}"
             )
 
             self._on_event(DetectionEvent(
+                session_id=self._session_id,
+                track_id=self._track_id,
                 window_index=self._window_index,
                 sample_start=window_start,
                 sample_end=window_start + AASIST_WINDOW_SAMPLES,
@@ -351,10 +478,27 @@ class SecurityPipeline:
                 invalidation_reason=calibrated.invalidation_reason,
             ))
 
+            self._on_event(ProtectionDecision(
+                session_id=self._session_id,
+                track_id=self._track_id,
+                decision=assessment.decision.value,
+                risk_level=assessment.risk_level.value,
+                reason=assessment.reason,
+                evidence_ids=list(self._evidence_ids),
+                timestamp=time.time(),
+                quality_status="OK",
+                calibration_status=calibrated.calibration_status,
+                window_count=self._valid_windows_count,
+                suspicious_count=self._suspicious_windows_count,
+                spoof_score_avg=assessment.spoof_score_avg,
+            ))
+
         except Exception as e:
             self._pipeline_errors += 1
             logger.error(f"AASIST inference error: {e}", exc_info=True)
             self._on_event(DetectionEvent(
+                session_id=self._session_id,
+                track_id=self._track_id,
                 window_index=self._window_index,
                 sample_start=window_start,
                 sample_end=window_start + AASIST_WINDOW_SAMPLES,
@@ -382,6 +526,8 @@ class SecurityPipeline:
 
             if not ecapa_service.is_loaded:
                 self._on_event(SpeakerEvent(
+                    session_id=self._session_id,
+                    track_id=self._track_id,
                     sample_start=self._speech_sample_start,
                     sample_end=self._speech_sample_start + len(segment),
                     calibration="MODEL_NOT_LOADED",
@@ -398,6 +544,8 @@ class SecurityPipeline:
             self._ecapa_inferences += 1
 
             self._on_event(SpeakerEvent(
+                session_id=self._session_id,
+                track_id=self._track_id,
                 sample_start=self._speech_sample_start,
                 sample_end=self._speech_sample_start + len(segment),
                 embedding_dim=len(embedding) if embedding is not None else 0,

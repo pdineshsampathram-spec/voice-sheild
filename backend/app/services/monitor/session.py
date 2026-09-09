@@ -52,9 +52,25 @@ class MonitorSession:
     - Shared ThreadPoolExecutor for ML inference
     """
 
-    def __init__(self, session_id: str = None, asr_model_size: str = "base"):
+    def __init__(
+        self,
+        session_id: str = None,
+        asr_model_size: str = "base",
+        room_id: Optional[str] = None,
+        observed_peer_id: Optional[str] = None,
+        track_id: Optional[str] = None,
+        track_source: str = "LOCAL_MIC",
+        track_direction: str = "inbound",
+        connection_generation: int = 1,
+    ):
         self.session_id = session_id or str(uuid.uuid4())
         self._asr_model_size = asr_model_size
+        self.room_id = room_id
+        self.observed_peer_id = observed_peer_id
+        self.track_id = track_id or f"track_{self.session_id[:8]}"
+        self.track_source = track_source
+        self.track_direction = track_direction
+        self.connection_generation = connection_generation
         self._started = False
         self._start_time: float = 0.0
 
@@ -99,6 +115,10 @@ class MonitorSession:
         now = time.time()
         self._event_seq += 1
         event_dict["session_id"] = self.session_id
+        event_dict["room_id"] = self.room_id
+        event_dict["observed_peer_id"] = self.observed_peer_id
+        event_dict["track_id"] = event_dict.get("track_id") or self.track_id
+        event_dict["track_source"] = event_dict.get("track_source") or self.track_source
         event_dict["event_id"] = f"{self.session_id[:8]}-{self._event_seq}"
         event_dict["seq"] = self._event_seq
         event_dict["timestamp"] = now
@@ -134,7 +154,7 @@ class MonitorSession:
                           creates and loads FasterWhisperProvider.
         """
         self._start_time = time.time()
-        logger.info(f"MonitorSession {self.session_id}: starting")
+        logger.info(f"MonitorSession {self.session_id}: starting (track={self.track_id}, source={self.track_source})")
         # Create ASR provider
         if asr_provider is None:
             asr_provider = HFWhisperProvider(
@@ -170,19 +190,32 @@ class MonitorSession:
             asr_provider=asr_provider,
             on_event=self._on_event,
             executor=self._executor,
+            session_id=self.session_id,
+            track_id=self.track_id,
         )
 
         self._security_pipeline = SecurityPipeline(
             audio_queue=security_queue,
             on_event=self._on_event,
             executor=self._executor,
+            session_id=self.session_id,
+            track_id=self.track_id,
         )
 
         # Wire discontinuity handler
         security_queue.on_discontinuity = self._security_pipeline.on_discontinuity
 
-        # Create WebRTC media receiver
-        self._webrtc_receiver = WebRTCMediaReceiver(self._audio_bus)
+        # Create WebRTC media receiver with track metadata
+        self._webrtc_receiver = WebRTCMediaReceiver(
+            audio_bus=self._audio_bus,
+            session_id=self.session_id,
+            room_id=self.room_id,
+            observed_peer_id=self.observed_peer_id,
+            track_id=self.track_id,
+            track_source=self.track_source,
+            track_direction=self.track_direction,
+            connection_generation=self.connection_generation,
+        )
 
         # Start pipelines
         await self._caption_pipeline.start()
@@ -237,6 +270,15 @@ class MonitorSession:
 
         telemetry = {
             "session_id": self.session_id,
+            "audio_truth": {
+                "session_id": self.session_id,
+                "room_id": self.room_id,
+                "observed_peer_id": self.observed_peer_id,
+                "track_id": self.track_id,
+                "track_source": self.track_source,
+                "track_direction": self.track_direction,
+                "connection_generation": self.connection_generation,
+            },
             "models": {
                 **asr_info,
                 "aasist_model": "Spectra-AASIST",

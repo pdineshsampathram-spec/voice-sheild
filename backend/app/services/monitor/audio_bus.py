@@ -32,14 +32,20 @@ class AudioChunk:
     sample_offset: int             # Absolute sample position since session start
     sample_rate: int = 16000       # Always 16000 after canonical conversion
     wall_timestamp: float = 0.0    # Wall-clock time for latency measurement only
+    session_id: str = ""           # Owning monitor session ID
+    track_id: str = ""             # Monitored WebRTC track ID
+    sequence_id: int = 0           # Monotonic chunk sequence index
+    sample_start: int = 0          # Exact starting sample index
+    sample_end: int = 0            # Exact ending sample index
+    timestamp_start: float = 0.0   # Wall-clock chunk onset
+    timestamp_end: float = 0.0     # Wall-clock chunk offset
+    discontinuity: bool = False    # True if audio stream suffered packet loss/gap
+    track_source: str = "LOCAL_MIC" # Explicit origin: LOCAL_MIC or REMOTE_PEER
+    track_direction: str = "inbound"
 
     @property
     def duration_seconds(self) -> float:
         return len(self.samples) / self.sample_rate
-
-    @property
-    def sample_end(self) -> int:
-        return self.sample_offset + len(self.samples)
 
 
 class OverflowPolicy(Enum):
@@ -183,23 +189,52 @@ class AudioBus:
             del self._consumers[name]
             logger.info(f"AudioBus: consumer '{name}' unsubscribed")
 
-    async def publish(self, samples: torch.Tensor, wall_timestamp: float = None):
-        """Publish a PCM chunk to all consumers.
+    async def publish(
+        self,
+        samples: torch.Tensor,
+        wall_timestamp: float = None,
+        session_id: str = "",
+        track_id: str = "",
+        discontinuity: bool = False,
+        track_source: str = "LOCAL_MIC",
+        track_direction: str = "inbound",
+    ):
+        """Publish a PCM chunk to all consumers with canonical timeline metadata.
 
         Args:
             samples: 1D float32 tensor at 16 kHz.
             wall_timestamp: Wall-clock time for latency measurement.
+            session_id: Monitor session ID.
+            track_id: Monitored track ID.
+            discontinuity: True if gap/loss occurred.
+            track_source: Explicit origin ("LOCAL_MIC" or "REMOTE_PEER").
+            track_direction: Direction ("inbound" or "outbound").
         """
         if wall_timestamp is None:
             wall_timestamp = time.time()
 
+        sample_len = len(samples)
+        sample_start = self._sample_counter
+        sample_end = sample_start + sample_len
+        duration_s = sample_len / 16000.0
+
         chunk = AudioChunk(
             samples=samples,
-            sample_offset=self._sample_counter,
+            sample_offset=sample_start,
             sample_rate=16000,
             wall_timestamp=wall_timestamp,
+            session_id=session_id,
+            track_id=track_id,
+            sequence_id=self._total_published,
+            sample_start=sample_start,
+            sample_end=sample_end,
+            timestamp_start=wall_timestamp,
+            timestamp_end=wall_timestamp + duration_s,
+            discontinuity=discontinuity,
+            track_source=track_source,
+            track_direction=track_direction,
         )
-        self._sample_counter += len(samples)
+        self._sample_counter = sample_end
         self._total_published += 1
 
         for consumer in self._consumers.values():

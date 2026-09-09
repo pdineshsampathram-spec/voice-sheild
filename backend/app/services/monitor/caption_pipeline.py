@@ -33,17 +33,21 @@ logger = logging.getLogger(__name__)
 # Silero VAD frame size required at 16kHz
 VAD_FRAME_SAMPLES = 512  # 32ms at 16kHz
 
-# PROVISIONAL AUDIO-QUALITY HEURISTICS (Subject to benchmark validation)
-PROVISIONAL_MIN_SPEECH_SAMPLES = 3200    # 0.20s at 16kHz (allows short words: "hello", "hi", "yes")
-PROVISIONAL_MIN_RMS = 0.0015             # Noise floor guard to prevent hallucination on quiet noise
-PROVISIONAL_SILENCE_FRAMES_OFFSET = 10  # ~320ms continuous silence to trigger segment end
-MAX_SEGMENT_SAMPLES = 480000            # 30s at 16kHz max segment before forced finalization
+# Voice-Assistant Streaming & Endpointing Constants
+SPEECH_ONSET_FRAMES = 3          # Require 3 consecutive speech frames (~96ms) to trigger onset
+PAUSE_ENDPOINT_FRAMES = 16       # ~512ms of continuous silence to trigger End-of-Utterance (EOU)
+MIN_UTTERANCE_SAMPLES = 4800     # 0.30s at 16kHz minimum valid utterance duration
+MIN_UTTERANCE_RMS = 0.0038       # Genuine vocal speech acoustic energy floor (rejects ambient noise)
+MAX_SEGMENT_SAMPLES = 240000     # 15s at 16kHz max segment before forced finalization
+PARTIAL_INTERVAL_SAMPLES = 12800 # ~800ms of incremental speech to dispatch a partial hypothesis
 
 
 @dataclass
 class CaptionEvent:
     """Event emitted by the caption pipeline with verified runtime lineage."""
     type: str = "caption"
+    session_id: str = ""
+    track_id: str = ""
     text: str = ""
     is_partial: bool = True
     sample_start: int = 0
@@ -56,6 +60,7 @@ class CaptionEvent:
     asr_model: str = ""
     asr_backend: str = ""
     vad_speech_active: bool = False
+    confidence: float = 0.0
 
 
 @dataclass
@@ -65,10 +70,13 @@ class _ASRTask:
     sample_start: int
     sample_end: int
     dispatch_time: float
+    is_partial: bool = False
+    session_id: str = ""
+    track_id: str = ""
 
 
 class CaptionPipeline:
-    """Streaming caption pipeline with independent VAD and decoupled ASR worker.
+    """Voice-assistant style streaming caption pipeline with endpointing and decoupled ASR worker.
 
     Owns its own VAD instance — no shared mutable recurrent state
     with the security pipeline. If ASR stalls, it does NOT affect
@@ -81,23 +89,30 @@ class CaptionPipeline:
         asr_provider: ASRProvider,
         on_event: Callable[[CaptionEvent], None],
         executor: Optional[ThreadPoolExecutor] = None,
+        session_id: str = "",
+        track_id: str = "",
     ):
         self._queue = audio_queue
         self._asr = asr_provider
         self._on_event = on_event
         self._executor = executor or ThreadPoolExecutor(max_workers=1)
+        self._session_id = session_id
+        self._track_id = track_id
 
         # VAD state — independent instance
         self._vad_model = None
         self._vad_loaded = False
         self._vad_accumulator = torch.tensor([], dtype=torch.float32)
 
-        # Hysteresis state for VAD speech boundary detection
+        # Voice-assistant endpointing & hysteresis state
         self._in_speech = False
+        self._consecutive_speech_count = 0
+        self._onset_frames_buffer: list[torch.Tensor] = []
         self._silence_frame_count = 0
         self._speech_start_offset: int = 0
         self._speech_buffer: list[torch.Tensor] = []
         self._total_speech_samples = 0
+        self._last_partial_sample_count = 0
 
         # Detached ASR work queue to decouple audio ingest from inference
         self._asr_queue: asyncio.Queue[_ASRTask] = asyncio.Queue(maxsize=50)
@@ -105,6 +120,8 @@ class CaptionPipeline:
         # Telemetry counters
         self._total_asr_jobs_queued = 0
         self._total_asr_jobs_completed = 0
+        self._total_partials_emitted = 0
+        self._total_finals_emitted = 0
         self._pipeline_errors = 0
 
         # Running tasks
@@ -205,56 +222,93 @@ class CaptionPipeline:
             return True
 
     def _handle_vad_frame(self, is_speech: bool, frame: torch.Tensor, current_sample_offset: int):
-        """Manage speech segment accumulation with hysteresis."""
+        """Manage speech segment accumulation with voice-assistant streaming & endpointing."""
         if is_speech:
             self._silence_frame_count = 0
+            self._consecutive_speech_count += 1
+
             if not self._in_speech:
-                # Speech onset
-                self._in_speech = True
-                self._speech_start_offset = current_sample_offset
-                self._speech_buffer = []
-                self._total_speech_samples = 0
+                # Buffer onset frames to prevent clipping first phoneme
+                self._onset_frames_buffer.append(frame)
+                if self._consecutive_speech_count >= SPEECH_ONSET_FRAMES:
+                    # Verified Speech Onset
+                    self._in_speech = True
+                    self._speech_start_offset = current_sample_offset - (len(self._onset_frames_buffer) * VAD_FRAME_SAMPLES)
+                    if self._speech_start_offset < 0:
+                        self._speech_start_offset = 0
+                    self._speech_buffer = list(self._onset_frames_buffer)
+                    self._onset_frames_buffer = []
+                    self._total_speech_samples = sum(len(f) for f in self._speech_buffer)
+                    self._last_partial_sample_count = self._total_speech_samples
 
-                self._on_event(CaptionEvent(
-                    type="vad",
-                    vad_speech_active=True,
-                    sample_start=self._speech_start_offset,
-                    sample_end=self._speech_start_offset + len(frame),
-                ))
+                    self._on_event(CaptionEvent(
+                        type="vad",
+                        session_id=self._session_id,
+                        track_id=self._track_id,
+                        vad_speech_active=True,
+                        sample_start=self._speech_start_offset,
+                        sample_end=self._speech_start_offset + self._total_speech_samples,
+                    ))
+            else:
+                # Speech continuation
+                self._speech_buffer.append(frame)
+                self._total_speech_samples += len(frame)
 
-            self._speech_buffer.append(frame)
-            self._total_speech_samples += len(frame)
-
-            # Emit partial status (speech in progress)
-            self._on_event(CaptionEvent(
-                type="caption",
-                text="",
-                is_partial=True,
-                sample_start=self._speech_start_offset,
-                sample_end=self._speech_start_offset + self._total_speech_samples,
-                vad_speech_active=True,
-            ))
+                # Incremental partial dispatch if sufficient new speech arrived
+                if (self._total_speech_samples - self._last_partial_sample_count) >= PARTIAL_INTERVAL_SAMPLES:
+                    self._last_partial_sample_count = self._total_speech_samples
+                    self._dispatch_partial_segment()
 
         else:
-            if self._in_speech:
-                # Keep buffering a small amount of trailing silence for smooth acoustics
+            # Silence frame
+            self._consecutive_speech_count = 0
+            if not self._in_speech:
+                # Keep rolling onset buffer limited to SPEECH_ONSET_FRAMES
+                self._onset_frames_buffer.append(frame)
+                if len(self._onset_frames_buffer) > SPEECH_ONSET_FRAMES:
+                    self._onset_frames_buffer.pop(0)
+            else:
+                # Inside speech: accumulate pause frames until endpoint threshold
                 self._speech_buffer.append(frame)
                 self._total_speech_samples += len(frame)
                 self._silence_frame_count += 1
 
-                # Check if silence sustained long enough to trigger speech offset
-                if self._silence_frame_count >= PROVISIONAL_SILENCE_FRAMES_OFFSET:
-                    self._dispatch_current_segment()
+                if self._silence_frame_count >= PAUSE_ENDPOINT_FRAMES:
+                    # END-OF-UTTERANCE (EOU) reached
+                    self._dispatch_final_segment()
                     self._reset_vad_state()
                     self._on_event(CaptionEvent(
                         type="vad",
+                        session_id=self._session_id,
+                        track_id=self._track_id,
                         vad_speech_active=False,
                         sample_start=self._speech_start_offset,
                         sample_end=self._speech_start_offset + self._total_speech_samples,
                     ))
 
-    def _dispatch_current_segment(self):
-        """Hand off accumulated speech to detached ASR worker queue."""
+    def _dispatch_partial_segment(self):
+        """Dispatch partial speech segment for real-time live preview."""
+        if not self._speech_buffer or self._total_speech_samples < MIN_UTTERANCE_SAMPLES:
+            return
+
+        segment = torch.cat(self._speech_buffer)
+        task = _ASRTask(
+            segment=segment,
+            sample_start=self._speech_start_offset,
+            sample_end=self._speech_start_offset + len(segment),
+            dispatch_time=time.time(),
+            is_partial=True,
+            session_id=self._session_id,
+            track_id=self._track_id,
+        )
+        try:
+            self._asr_queue.put_nowait(task)
+            self._total_asr_jobs_queued += 1
+        except asyncio.QueueFull:
+            pass  # Dropping partials under load is safe
+
+    def _dispatch_final_segment(self):
+        """Hand off completed utterance to detached ASR worker queue."""
         if not self._speech_buffer:
             self._in_speech = False
             return
@@ -263,27 +317,30 @@ class CaptionPipeline:
         start_offset = self._speech_start_offset
         end_offset = start_offset + len(segment)
 
-        # Reset accumulator state immediately
+        # Reset utterance state immediately
         self._in_speech = False
         self._speech_buffer = []
         self._total_speech_samples = 0
         self._silence_frame_count = 0
+        self._consecutive_speech_count = 0
+        self._onset_frames_buffer = []
+        self._last_partial_sample_count = 0
 
-        # Check PROVISIONAL AUDIO-QUALITY HEURISTICS
+        # Acoustic gating to prevent hallucinating on silence or low-energy clicks
         duration_s = len(segment) / 16000.0
         rms = float(torch.sqrt(torch.mean(segment ** 2))) if len(segment) > 0 else 0.0
 
-        if len(segment) < PROVISIONAL_MIN_SPEECH_SAMPLES:
+        if len(segment) < MIN_UTTERANCE_SAMPLES:
             logger.debug(
-                f"[Provisional Heuristic] Discarding short segment: "
-                f"{len(segment)} samples ({duration_s:.2f}s < {PROVISIONAL_MIN_SPEECH_SAMPLES/16000:.2f}s)"
+                f"[CaptionPipeline] Discarding short segment: "
+                f"{len(segment)} samples ({duration_s:.2f}s < {MIN_UTTERANCE_SAMPLES/16000:.2f}s)"
             )
             return
 
-        if rms < PROVISIONAL_MIN_RMS:
+        if rms < MIN_UTTERANCE_RMS:
             logger.debug(
-                f"[Provisional Heuristic] Discarding low-energy noise segment: "
-                f"RMS {rms:.5f} < {PROVISIONAL_MIN_RMS}"
+                f"[CaptionPipeline] Discarding low-energy silence/noise segment: "
+                f"RMS {rms:.5f} < {MIN_UTTERANCE_RMS}"
             )
             return
 
@@ -292,6 +349,9 @@ class CaptionPipeline:
             sample_start=start_offset,
             sample_end=end_offset,
             dispatch_time=time.time(),
+            is_partial=False,
+            session_id=self._session_id,
+            track_id=self._track_id,
         )
 
         try:
@@ -300,6 +360,10 @@ class CaptionPipeline:
         except asyncio.QueueFull:
             self._pipeline_errors += 1
             logger.warning("CaptionPipeline ASR worker queue full; dropping segment")
+
+    def _dispatch_current_segment(self):
+        """Alias for final segment dispatch on shutdown or max duration."""
+        self._dispatch_final_segment()
 
     async def _run_asr_worker(self):
         """Detached worker loop executing ASR inference without blocking ingest."""
@@ -321,18 +385,25 @@ class CaptionPipeline:
                 )
                 self._total_asr_jobs_completed += 1
 
+                if task.is_partial:
+                    self._total_partials_emitted += 1
+                else:
+                    self._total_finals_emitted += 1
+
                 logger.info(
-                    f"[LIVE TRACE: ASR-{self._total_asr_jobs_completed}] AUDIO: samples=[{task.sample_start}..{task.sample_end}] "
-                    f"({len(task.segment)/16000:.2f}s) | ASR: provider={type(self._asr).__name__} "
-                    f"model={getattr(self._asr, 'model_name', result.model_name)} latency={result.latency_ms:.1f}ms "
+                    f"[LIVE TRACE: ASR] task={'PARTIAL' if task.is_partial else 'FINAL'} "
+                    f"track={task.track_id} samples=[{task.sample_start}..{task.sample_end}] "
+                    f"({len(task.segment)/16000:.2f}s) | latency={result.latency_ms:.1f}ms "
                     f"transcript='{result.text.strip()}'"
                 )
 
                 if result.text.strip():
                     self._on_event(CaptionEvent(
                         type="caption",
+                        session_id=task.session_id,
+                        track_id=task.track_id,
                         text=result.text.strip(),
-                        is_partial=False,
+                        is_partial=task.is_partial,
                         sample_start=result.sample_start,
                         sample_end=result.sample_end,
                         caption_start=result.sample_start,
@@ -341,8 +412,9 @@ class CaptionPipeline:
                         model_name=result.model_name,
                         asr_provider=type(self._asr).__name__,
                         asr_model=getattr(self._asr, "model_name", result.model_name),
-                        asr_backend=getattr(self._asr, "backend", "ctranslate2"),
-                        vad_speech_active=False,
+                        asr_backend=getattr(self._asr, "backend", "transformers"),
+                        vad_speech_active=task.is_partial,
+                        confidence=getattr(result, "confidence", 1.0),
                     ))
 
             except Exception as e:
@@ -350,6 +422,8 @@ class CaptionPipeline:
                 logger.error(f"ASR inference error: {e}", exc_info=True)
                 self._on_event(CaptionEvent(
                     type="caption_error",
+                    session_id=task.session_id,
+                    track_id=task.track_id,
                     text=f"ASR error: {e}",
                     sample_start=task.sample_start,
                     sample_end=task.sample_end,
