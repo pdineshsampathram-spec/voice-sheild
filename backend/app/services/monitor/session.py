@@ -268,6 +268,13 @@ class MonitorSession:
                 "asr_loaded": asr.is_loaded() if hasattr(asr, "is_loaded") else True,
             }
 
+        webrtc_telemetry = self._webrtc_receiver.get_telemetry_dict() if self._webrtc_receiver else {}
+        vad_speech_active = False
+        vad_prob = 0.0
+        if self._caption_pipeline:
+            vad_speech_active = getattr(self._caption_pipeline, "_in_speech", False)
+            vad_prob = getattr(self._caption_pipeline, "_last_vad_prob", 0.0)
+
         telemetry = {
             "session_id": self.session_id,
             "audio_truth": {
@@ -278,6 +285,21 @@ class MonitorSession:
                 "track_source": self.track_source,
                 "track_direction": self.track_direction,
                 "connection_generation": self.connection_generation,
+                # Canonical signal measurements
+                "frames_received": webrtc_telemetry.get("frames_decoded", 0),
+                "packets_received": webrtc_telemetry.get("packets_received", 0),
+                "canonical_samples": webrtc_telemetry.get("total_samples", 0),
+                "audio_duration": webrtc_telemetry.get("total_duration_s", 0.0),
+                "current_timestamp": webrtc_telemetry.get("last_sample_timestamp", time.time()),
+                "rms": webrtc_telemetry.get("rms", 0.0),
+                "peak": webrtc_telemetry.get("peak", 0.0),
+                "vad_probability": vad_prob,
+                "speech_active": vad_speech_active,
+                "status": webrtc_telemetry.get("status", "idle"),
+                "codec": webrtc_telemetry.get("codec", "unknown"),
+                "sample_rate": webrtc_telemetry.get("source_sample_rate", 0),
+                "channels": webrtc_telemetry.get("source_channels", 0),
+                "resampler_active": webrtc_telemetry.get("resampler_active", False),
             },
             "models": {
                 **asr_info,
@@ -303,7 +325,10 @@ class MonitorSession:
         }
 
         if self._webrtc_receiver:
-            telemetry["webrtc"] = self._webrtc_receiver.get_telemetry_dict()
+            # Inject latest VAD into receiver telemetry for fallback parity
+            webrtc_telemetry["vad_probability"] = vad_prob
+            webrtc_telemetry["speech_active"] = vad_speech_active
+            telemetry["webrtc"] = webrtc_telemetry
         else:
             telemetry["webrtc"] = {"status": "unavailable"}
 

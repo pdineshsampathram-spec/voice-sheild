@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -132,6 +133,9 @@ class SpectraAASISTDetector:
         """
         if not self._loaded:
             raise RuntimeError("Spectra-AASIST model is not loaded")
+
+        if isinstance(audio_tensor, np.ndarray):
+            audio_tensor = torch.from_numpy(audio_tensor).float()
 
         # Ensure correct shape: (batch=1, samples)
         if audio_tensor.ndim == 1:

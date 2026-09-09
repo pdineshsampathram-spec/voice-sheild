@@ -37,7 +37,7 @@ VAD_FRAME_SAMPLES = 512  # 32ms at 16kHz
 SPEECH_ONSET_FRAMES = 3          # Require 3 consecutive speech frames (~96ms) to trigger onset
 PAUSE_ENDPOINT_FRAMES = 16       # ~512ms of continuous silence to trigger End-of-Utterance (EOU)
 MIN_UTTERANCE_SAMPLES = 4800     # 0.30s at 16kHz minimum valid utterance duration
-MIN_UTTERANCE_RMS = 0.0038       # Genuine vocal speech acoustic energy floor (rejects ambient noise)
+MIN_UTTERANCE_RMS = 0.0010       # Rejects pure digital silence / line noise while preserving quiet speech
 MAX_SEGMENT_SAMPLES = 240000     # 15s at 16kHz max segment before forced finalization
 PARTIAL_INTERVAL_SAMPLES = 12800 # ~800ms of incremental speech to dispatch a partial hypothesis
 
@@ -103,6 +103,7 @@ class CaptionPipeline:
         self._vad_model = None
         self._vad_loaded = False
         self._vad_accumulator = torch.tensor([], dtype=torch.float32)
+        self._last_vad_prob: float = 0.0
 
         # Voice-assistant endpointing & hysteresis state
         self._in_speech = False
@@ -216,9 +217,11 @@ class CaptionPipeline:
 
         try:
             prob = self._vad_model(frame, 16000).item()
+            self._last_vad_prob = prob
             return prob > 0.5
         except Exception as e:
             logger.debug(f"Silero VAD frame evaluation exception: {e}")
+            self._last_vad_prob = 0.0
             return True
 
     def _handle_vad_frame(self, is_speech: bool, frame: torch.Tensor, current_sample_offset: int):
@@ -436,6 +439,7 @@ class CaptionPipeline:
         return {
             "vad_loaded": self._vad_loaded,
             "vad_speech_active": self._in_speech,
+            "last_vad_probability": round(self._last_vad_prob, 4),
             "asr_jobs_queued": self._total_asr_jobs_queued,
             "asr_jobs_completed": self._total_asr_jobs_completed,
             "asr_queue_depth": self._asr_queue.qsize(),

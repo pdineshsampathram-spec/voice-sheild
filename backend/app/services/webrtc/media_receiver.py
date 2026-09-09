@@ -62,6 +62,8 @@ class AudioTelemetry:
     last_sample_timestamp: float = 0.0
     resampler_active: bool = False
     sequence_counter: int = 0
+    vad_probability: float = 0.0
+    speech_active: bool = False
 
 
 class AudioTrackConsumer:
@@ -210,6 +212,8 @@ class AudioTrackConsumer:
                     wall_timestamp=now,
                     session_id=self._session_id,
                     track_id=self._track_id,
+                    track_source=self._telemetry.track_source,
+                    track_direction=self._track_direction,
                 )
 
             except asyncio.CancelledError:
@@ -360,14 +364,20 @@ class WebRTCMediaReceiver:
             "canonical_sample_rate": CANONICAL_SAMPLE_RATE,
             "packets_received": t.packets_received,
             "frames_decoded": t.frames_decoded,
+            "frames_received": t.frames_decoded,
             "total_samples": t.total_samples_decoded,
+            "samples_received": t.total_samples_decoded,
             "total_duration_s": round(
                 t.total_samples_decoded / CANONICAL_SAMPLE_RATE, 2
             ) if t.total_samples_decoded > 0 else 0,
             "rms": round(t.rms, 6),
+            "current_rms": round(t.rms, 6),
             "peak": round(t.peak, 6),
+            "current_peak": round(t.peak, 6),
             "zero_pct": round(t.zero_percentage, 2),
             "first_sample_timestamp": t.first_sample_timestamp,
             "last_sample_timestamp": t.last_sample_timestamp,
             "resampler_active": t.resampler_active,
+            "vad_probability": t.vad_probability,
+            "speech_active": t.speech_active,
         }

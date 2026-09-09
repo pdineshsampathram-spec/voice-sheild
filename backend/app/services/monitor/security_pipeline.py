@@ -324,38 +324,33 @@ class SecurityPipeline:
         try:
             from app.services.antispoof.spectra_detector import spectra_detector
 
-            if not spectra_detector.is_loaded:
-                self._on_event(DetectionEvent(
-                    window_index=self._window_index,
-                    sample_start=window_start,
-                    sample_end=window_start + AASIST_WINDOW_SAMPLES,
-                    model="Spectra-AASIST",
-                    calibration_status="MODEL_NOT_LOADED",
-                    decision="UNAVAILABLE",
-                    window_valid=False,
-                    invalidation_reason="AASIST model not loaded",
-                ))
-                return
-
             # Compute window acoustic energy
             window_rms = float(torch.sqrt(torch.mean(window ** 2)))
 
-            # Evaluate VAD speech frames across window (126 frames of 512 samples)
-            speech_frames = 0
-            total_frames = len(window) // VAD_FRAME_SAMPLES
-            if self._vad_loaded and total_frames > 0:
-                for i in range(total_frames):
-                    f = window[i * VAD_FRAME_SAMPLES:(i + 1) * VAD_FRAME_SAMPLES]
+            # Pre-filter silence: if window energy is below ambient floor, skip VAD entirely
+            if window_rms < 0.0015:
+                speech_ratio = 0.0
+                is_silence = True
+            elif self._vad_loaded:
+                def _eval_vad(w_tensor, vad_model):
                     try:
-                        if self._vad_model(f, 16000).item() > 0.5:
-                            speech_frames += 1
+                        from silero_vad.utils_vad import get_speech_timestamps
+                        ts = get_speech_timestamps(w_tensor, vad_model, sampling_rate=16000)
+                        speech_samples = sum(s['end'] - s['start'] for s in ts)
+                        return speech_samples / len(w_tensor)
                     except Exception:
-                        pass
-                speech_ratio = speech_frames / total_frames
-            else:
-                speech_ratio = 1.0 if window_rms >= 0.003 else 0.0
+                        return 1.0  # Safe fallback if VAD fails
 
-            is_silence = (window_rms < 0.003) or (speech_ratio < 0.10)
+                speech_ratio = await loop.run_in_executor(
+                    self._executor,
+                    _eval_vad,
+                    window,
+                    self._vad_model,
+                )
+                is_silence = (window_rms < 0.0020) or (speech_ratio < 0.05)
+            else:
+                speech_ratio = 1.0 if window_rms >= 0.0020 else 0.0
+                is_silence = window_rms < 0.0020
 
             # ZERO-TRUST SILENCE GUARD: If window contains silence or no speech,
             # DO NOT run AASIST (which yields erratic ~0.98 logits on empty audio).
@@ -402,6 +397,22 @@ class SecurityPipeline:
                     window_count=self._valid_windows_count,
                     suspicious_count=self._suspicious_windows_count,
                     spoof_score_avg=round(sum(self._risk_engine._spoof_history) / len(self._risk_engine._spoof_history), 4) if self._risk_engine._spoof_history else 0.0,
+                ))
+                return
+
+            # Check model availability on validated speech window before inference
+            if not spectra_detector.is_loaded:
+                self._on_event(DetectionEvent(
+                    session_id=self._session_id,
+                    track_id=self._track_id,
+                    window_index=self._window_index,
+                    sample_start=window_start,
+                    sample_end=window_start + AASIST_WINDOW_SAMPLES,
+                    model="Spectra-AASIST",
+                    calibration_status="MODEL_NOT_LOADED",
+                    decision="UNAVAILABLE",
+                    window_valid=False,
+                    invalidation_reason="AASIST model not loaded",
                 ))
                 return
 
