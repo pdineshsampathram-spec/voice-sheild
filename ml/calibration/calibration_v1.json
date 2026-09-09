@@ -1,0 +1,24 @@
+{
+  "model": "Spectra-AASIST",
+  "version": "v1.1-val-frozen",
+  "method": "platt",
+  "domain": "webrtc_opus",
+  "operating_threshold": 0.4998925121446346,
+  "validation_eer": 0.23333333333333334,
+  "params": {
+    "a": 0.12237763981379012,
+    "b": -0.0006257556517867489
+  },
+  "metadata": {
+    "description": "Fitted on speaker-disjoint validation split with Opus and neural vocoder samples",
+    "quality_gate_rms": 0.0025,
+    "val_speakers": [
+      "Samantha",
+      "Daniel",
+      "Rishi"
+    ],
+    "val_samples_count": 60,
+    "validation_eer": 0.2333,
+    "date": "2026-09-09T05:37:55.293220+00:00"
+  }
+}

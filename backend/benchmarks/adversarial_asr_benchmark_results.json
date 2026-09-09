@@ -1,0 +1,326 @@
+[
+  {
+    "model_desc": "HF Whisper Tiny (Greedy, beam=1)",
+    "model_size": "tiny",
+    "beam_size": 1,
+    "overall_wer_pct": 6.64,
+    "overall_cer_pct": 3.62,
+    "exact_match_pct": 62.5,
+    "latency_p50_ms": 383.3,
+    "latency_p95_ms": 608.1,
+    "rtf": 0.095,
+    "silence_hallucination": 0,
+    "line_hum_hallucination": 1,
+    "category_metrics": {
+      "spontaneous_speech": {
+        "mean_wer_pct": 30.68,
+        "mean_cer_pct": 19.5,
+        "exact_match_pct": 0.0,
+        "count": 2
+      },
+      "short_utterance": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 2
+      },
+      "long_sentence": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "pause": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "multiple_sentences": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "accent": {
+        "mean_wer_pct": 4.58,
+        "mean_cer_pct": 2.36,
+        "exact_match_pct": 50.0,
+        "count": 4
+      },
+      "fast_speech": {
+        "mean_wer_pct": 15.38,
+        "mean_cer_pct": 5.48,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "slow_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "background_noise_20db": {
+        "mean_wer_pct": 11.11,
+        "mean_cer_pct": 4.0,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "background_noise_10db": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "quiet_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "model_desc": "HF Whisper Tiny (Beam-5)",
+    "model_size": "tiny",
+    "beam_size": 5,
+    "overall_wer_pct": 5.49,
+    "overall_cer_pct": 3.03,
+    "exact_match_pct": 75.0,
+    "latency_p50_ms": 366.1,
+    "latency_p95_ms": 474.3,
+    "rtf": 0.086,
+    "silence_hallucination": 1,
+    "line_hum_hallucination": 1,
+    "category_metrics": {
+      "spontaneous_speech": {
+        "mean_wer_pct": 30.68,
+        "mean_cer_pct": 19.5,
+        "exact_match_pct": 0.0,
+        "count": 2
+      },
+      "short_utterance": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 2
+      },
+      "long_sentence": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "pause": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "multiple_sentences": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "accent": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 4
+      },
+      "fast_speech": {
+        "mean_wer_pct": 15.38,
+        "mean_cer_pct": 5.48,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "slow_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "background_noise_20db": {
+        "mean_wer_pct": 11.11,
+        "mean_cer_pct": 4.0,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "background_noise_10db": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "quiet_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "model_desc": "HF Whisper Base (Greedy, beam=1)",
+    "model_size": "base",
+    "beam_size": 1,
+    "overall_wer_pct": 6.36,
+    "overall_cer_pct": 3.28,
+    "exact_match_pct": 62.5,
+    "latency_p50_ms": 551.6,
+    "latency_p95_ms": 671.8,
+    "rtf": 0.133,
+    "silence_hallucination": 1,
+    "line_hum_hallucination": 1,
+    "category_metrics": {
+      "spontaneous_speech": {
+        "mean_wer_pct": 26.14,
+        "mean_cer_pct": 19.44,
+        "exact_match_pct": 0.0,
+        "count": 2
+      },
+      "short_utterance": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 2
+      },
+      "long_sentence": {
+        "mean_wer_pct": 20.0,
+        "mean_cer_pct": 4.0,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "pause": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "multiple_sentences": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "accent": {
+        "mean_wer_pct": 2.08,
+        "mean_cer_pct": 1.04,
+        "exact_match_pct": 75.0,
+        "count": 4
+      },
+      "fast_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "slow_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "background_noise_20db": {
+        "mean_wer_pct": 11.11,
+        "mean_cer_pct": 4.0,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "background_noise_10db": {
+        "mean_wer_pct": 10.0,
+        "mean_cer_pct": 1.43,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "quiet_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      }
+    }
+  },
+  {
+    "model_desc": "HF Whisper Base (Beam-5)",
+    "model_size": "base",
+    "beam_size": 5,
+    "overall_wer_pct": 4.48,
+    "overall_cer_pct": 2.94,
+    "exact_match_pct": 75.0,
+    "latency_p50_ms": 677.1,
+    "latency_p95_ms": 1019.5,
+    "rtf": 0.171,
+    "silence_hallucination": 1,
+    "line_hum_hallucination": 1,
+    "category_metrics": {
+      "spontaneous_speech": {
+        "mean_wer_pct": 26.14,
+        "mean_cer_pct": 19.44,
+        "exact_match_pct": 0.0,
+        "count": 2
+      },
+      "short_utterance": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 2
+      },
+      "long_sentence": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "pause": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "multiple_sentences": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "accent": {
+        "mean_wer_pct": 2.08,
+        "mean_cer_pct": 1.04,
+        "exact_match_pct": 75.0,
+        "count": 4
+      },
+      "fast_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "slow_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "background_noise_20db": {
+        "mean_wer_pct": 11.11,
+        "mean_cer_pct": 4.0,
+        "exact_match_pct": 0.0,
+        "count": 1
+      },
+      "background_noise_10db": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      },
+      "quiet_speech": {
+        "mean_wer_pct": 0.0,
+        "mean_cer_pct": 0.0,
+        "exact_match_pct": 100.0,
+        "count": 1
+      }
+    }
+  }
+]
