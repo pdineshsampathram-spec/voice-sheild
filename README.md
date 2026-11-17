@@ -18,7 +18,7 @@
 
 ## 🚀 Live Demos & Downloads
 
-- 🌐 **Live WebRTC Web App (Vercel)**: [https://voice-shield.vercel.app](https://voice-shield.vercel.app)
+- 🌐 **Live WebRTC Web App (Vercel)**: [https://voice-shield-sih.vercel.app](https://voice-shield-sih.vercel.app)
 - 📦 **Android App Release APK**: [Download VoiceShield Release APK (v1.0.0)](https://github.com/pdineshsampathram-spec/voice-sheild/releases/download/v1.0.0-prototype/app-release.apk)
 - 🧪 **Android App Debug APK**: [Download VoiceShield Debug APK (v1.0.0)](https://github.com/pdineshsampathram-spec/voice-sheild/releases/download/v1.0.0-prototype/app-debug.apk)
 - 🏷️ **GitHub Release Page**: [VoiceShield v1.0.0 Releases](https://github.com/pdineshsampathram-spec/voice-sheild/releases/tag/v1.0.0-prototype)
@@ -408,7 +408,7 @@ Key parameters configurable in `.env`:
 # Server
 BACKEND_HOST=0.0.0.0
 BACKEND_PORT=8000
-CORS_ORIGINS=http://localhost:3000,https://voice-shield.vercel.app
+CORS_ORIGINS=http://localhost:3000,https://voice-shield-sih.vercel.app
 
 # Device execution (auto, cpu, cuda, mps)
 DEVICE=auto

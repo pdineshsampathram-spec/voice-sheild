@@ -15,7 +15,7 @@ export async function GET() {
     alerts: [
       {
         alert_id: "alt_demo_01",
-        timestamp: new Date(Date.now() - 120000).toLocaleTimeString(),
+        timestamp: new Date(Date.now() - 120000).toISOString(),
         level: "CRITICAL",
         title: "Synthetic Voice Clone Detected",
         message: "High-probability cloned voice detected (spectral artifacts in high frequencies).",
@@ -25,7 +25,7 @@ export async function GET() {
       },
       {
         alert_id: "alt_demo_02",
-        timestamp: new Date(Date.now() - 3600000).toLocaleTimeString(),
+        timestamp: new Date(Date.now() - 3600000).toISOString(),
         level: "MEDIUM",
         title: "Speaker Identity Discrepancy",
         message: "Voice biometric discrepancy detected against enrolled profile.",
