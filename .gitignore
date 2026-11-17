@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+.next/
+.pytest_cache/
+
+# Model cache
+model_cache/
+speaker_profiles/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+pgdata/
+redisdata/
+
+# Build & Outputs
+dist/
+build/
+*.egg-info/
+out/
+*.tsbuildinfo
+
+# Android & Gradle
+.gradle/
+*.apk
+*.aab
+*.jks
+*.keystore
+key.properties
+local.properties
+.kotlin/
+
+# Temporary caches
+recordings_cache/
+backend/recordings_cache/
+pretrained_models/

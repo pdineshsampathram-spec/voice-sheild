@@ -46,9 +46,42 @@ async def lifespan(app: FastAPI):
     from app.services.speaker.ecapa_service import ecapa_service
     ecapa_service.load_model()
 
-    # 4. Faster-Whisper ASR (pre-warm to eliminate session startup latency)
+    # 4. Faster-Whisper ASR — loaded ONCE, shared across all sessions (Fix C1)
     from app.api.ws_monitor import _get_or_create_asr
     asr_provider = _get_or_create_asr("base")
+    asr_status = "ONLINE" if asr_provider.is_loaded() else "ASR_UNAVAILABLE"
+
+    # 5. Score calibration artifact lifecycle (Fix M3)
+    from app.services.antispoof.calibrator import score_calibrator
+    from pathlib import Path
+
+    calibration_candidates = [
+        Path("models/calibration_v1.json"),
+        Path("backend/models/calibration_v1.json"),
+        Path(__file__).parent.parent / "models" / "calibration_v1.json",
+    ]
+    calibration_artifact_path = None
+    for cand in calibration_candidates:
+        if cand.exists():
+            calibration_artifact_path = cand
+            break
+
+    if calibration_artifact_path is not None:
+        loaded = score_calibrator.load(calibration_artifact_path)
+        if loaded:
+            calibration_status = f"CALIBRATED (v={score_calibrator.version}, domain={score_calibrator.domain})"
+        else:
+            calibration_status = score_calibrator.status
+            logger.warning(
+                f"Calibration artifact exists at {calibration_artifact_path} "
+                f"but failed validation. Status: {calibration_status}."
+            )
+    else:
+        calibration_status = "UNCALIBRATED"
+        logger.info(
+            "No calibration artifact found. "
+            "All anti-spoof decisions will report UNCALIBRATED status."
+        )
 
     elapsed = time.time() - start
     logger.info("=" * 60)
@@ -56,7 +89,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Spectra-AASIST: {spectra_detector.status}")
     logger.info(f"  ECAPA-TDNN:     {ecapa_service.status}")
     logger.info(f"  Silero VAD:     {vad_service.status}")
-    logger.info(f"  Faster-Whisper: {'ONLINE' if asr_provider.is_loaded() else 'ERROR'}")
+    logger.info(f"  Faster-Whisper: {asr_status}")
+    logger.info(f"  Calibration:    {calibration_status}")
     logger.info("=" * 60)
 
     yield

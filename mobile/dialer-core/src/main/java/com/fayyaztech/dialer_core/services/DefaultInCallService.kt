@@ -1,0 +1,1078 @@
+package com.fayyaztech.dialer_core.services
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Person
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.os.Build
+import android.telecom.Call
+import android.telecom.DisconnectCause
+import android.telecom.InCallService
+import android.util.Log
+import android.Manifest
+import android.content.pm.PackageManager
+import android.provider.ContactsContract
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import com.fayyaztech.dialer_core.ui.call.CallScreenActivity
+import com.fayyaztech.dialer_core.callbacks.CallStateListener
+// DISCONNECT_TRACKING
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.telephony.TelephonyManager
+import com.fayyaztech.dialer_core.model.CallSnapshot
+import com.fayyaztech.dialer_core.model.DisconnectReason
+import com.fayyaztech.dialer_core.utils.DisconnectReasonClassifier
+
+/**
+ * In-call service implementation used by Telecom for presenting in-call UI and for controlling call
+ * audio routing (mute / speaker). This used to be named "CallScreeningService" which collides with
+ * the framework's android.telecom.CallScreeningService on newer Android releases.
+ *
+ * Rename to DefaultInCallService to avoid confusion and ensure Telecom binds the correct
+ * InCallService implementation reliably on Android 13+.
+ */
+class DefaultInCallService : InCallService() {
+
+    companion object {
+        const val TAG = "DefaultInCallService"
+        const val ACTION_AUDIO_STATE_CHANGED = "com.sycet.defaultdialer.ACTION_AUDIO_STATE_CHANGED"
+        const val EXTRA_AUDIO_STATE = "EXTRA_AUDIO_STATE"
+        var currentCall: Call? = null
+        var callDisconnectedBy: String = "Unknown"
+        var lastDisconnectParty: String = "unknown"
+        var lastDisconnectCauseCode: Int = DisconnectCause.UNKNOWN
+        // DISCONNECT_TRACKING: fine-grained reason + call context at disconnect
+        var lastDisconnectReason: DisconnectReason = DisconnectReason.UNKNOWN
+        var lastCallStateAtEnd: String = "unknown"
+        var lastAudioRouteAtEnd: Int = 0
+        var lastSignalStrengthAtEnd: Int = -1
+
+        private const val DISCONNECT_PARTY_LOCAL = "local"
+        private const val DISCONNECT_PARTY_REMOTE = "remote"
+        private const val LOCAL_DISCONNECT_MARK_VALIDITY_MS = 12_000L
+        private val userDisconnectMarks: MutableMap<String, Long> = mutableMapOf()
+        private var globalUserDisconnectMarkAtMs: Long = 0L
+        
+        // Platform-agnostic callback listeners for call state changes (multiple supported)
+        private val callStateListeners: MutableList<CallStateListener> = mutableListOf()
+        
+        // Keep reference to the service instance for audio routing
+        private var instance: DefaultInCallService? = null
+        // Audio manager for muting / speaker control. Must be obtained from the InCallService
+        private var audioManager: AudioManager? = null
+        private var audioFocusRequest: AudioFocusRequest? = null
+        private var hasAudioFocus: Boolean = false
+        // Track whether the user explicitly requested speaker on (vs. OEM auto-routing it)
+        private var speakerForcedByUser: Boolean = false
+        // Whether we have already corrected the initial audio route for this call
+        private var initialRouteFixed: Boolean = false
+
+        private val afChangeListener =
+                AudioManager.OnAudioFocusChangeListener { focusChange ->
+                    when (focusChange) {
+                        AudioManager.AUDIOFOCUS_GAIN -> Log.d(TAG, "Audio focus gained")
+                        AudioManager.AUDIOFOCUS_LOSS -> Log.d(TAG, "Audio focus lost")
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
+                                Log.d(TAG, "Audio focus lost transient")
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK ->
+                                Log.d(TAG, "Audio focus lost transient (duck)")
+                        else -> Log.d(TAG, "Audio focus changed: $focusChange")
+                    }
+                }
+
+        /**
+         * Get the number of active calls
+         */
+        fun getActiveCallCount(): Int {
+            return try {
+                instance?.calls?.size ?: 0
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get active call count: ${e.message}")
+                0
+            }
+        }
+
+        /**
+         * Get all active calls
+         */
+        fun getAllCalls(): List<Call> {
+            return try {
+                instance?.calls?.toList() ?: emptyList()
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to get all calls: ${e.message}")
+                emptyList()
+            }
+        }
+
+        fun muteCall(isMuted: Boolean) {
+            try {
+                // Prefer the Telecom API to mute the active Call — this ensures proper
+                // audio routing on Android 11+ where direct AudioManager microphone changes
+                // are ignored for telecom-managed calls.
+                var handled = false
+                currentCall?.let { call ->
+                    try {
+                        // Use reflection to invoke setMuted so this code compiles with older
+                        // compileSdk versions while still calling the API when available at
+                        // runtime.
+                        val method =
+                                call.javaClass.getMethod(
+                                        "setMuted",
+                                        Boolean::class.javaPrimitiveType
+                                )
+                        method.invoke(call, isMuted)
+                        Log.d(TAG, "muteCall -> Call.setMuted($isMuted) [via reflection]")
+                        handled = true
+                    } catch (e: Exception) {
+                        // Method unavailable or failed — fall back to AudioManager below.
+                        Log.d(
+                                TAG,
+                                "Call.setMuted unavailable (reflection failed), falling back: ${e.message}"
+                        )
+                    }
+                }
+
+                // Fallback to global microphone mute for older devices or when no active call
+                if (!handled) {
+                    audioManager?.isMicrophoneMute = isMuted
+                    Log.d(TAG, "muteCall -> AudioManager.isMicrophoneMute=$isMuted (fallback)")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "muteCall failed", e)
+            }
+        }
+
+        private fun requestAudioFocusIfNeeded() {
+            if (hasAudioFocus || audioManager == null) return
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val aa =
+                            AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                    .build()
+
+                    // Try transient focus first
+                    var req =
+                            AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                                    .setAudioAttributes(aa)
+                                    .setAcceptsDelayedFocusGain(false)
+                                    .setOnAudioFocusChangeListener(afChangeListener)
+                                    .build()
+
+                    var status =
+                            audioManager?.requestAudioFocus(req)
+                                    ?: AudioManager.AUDIOFOCUS_REQUEST_FAILED
+                    audioFocusRequest = req
+                    hasAudioFocus = status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+
+                    // Fallback to persistent focus if transient denied
+                    if (!hasAudioFocus) {
+                        Log.d(TAG, "Transient audio focus denied, trying AUDIOFOCUS_GAIN")
+                        req =
+                                AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                                        .setAudioAttributes(aa)
+                                        .setAcceptsDelayedFocusGain(false)
+                                        .setOnAudioFocusChangeListener(afChangeListener)
+                                        .build()
+                        status =
+                                audioManager?.requestAudioFocus(req)
+                                        ?: AudioManager.AUDIOFOCUS_REQUEST_FAILED
+                        if (status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                            audioFocusRequest = req
+                            hasAudioFocus = true
+                        } else {
+                            Log.w(TAG, "AUDIOFOCUS_GAIN also denied on fallback (O+)")
+                        }
+                    }
+                } else {
+                    var status =
+                            audioManager?.requestAudioFocus(
+                                    afChangeListener,
+                                    AudioManager.STREAM_VOICE_CALL,
+                                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+                            )
+                                    ?: AudioManager.AUDIOFOCUS_REQUEST_FAILED
+                    hasAudioFocus = status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+
+                    // Fallback to persistent focus
+                    if (!hasAudioFocus) {
+                        Log.d(TAG, "Transient audio focus denied (pre-O), trying AUDIOFOCUS_GAIN")
+                        status =
+                                audioManager?.requestAudioFocus(
+                                        afChangeListener,
+                                        AudioManager.STREAM_VOICE_CALL,
+                                        AudioManager.AUDIOFOCUS_GAIN
+                                )
+                                        ?: AudioManager.AUDIOFOCUS_REQUEST_FAILED
+                        hasAudioFocus = status == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                        if (!hasAudioFocus) {
+                            Log.w(TAG, "AUDIOFOCUS_GAIN denied (pre-O fallback)")
+                        }
+                    }
+                }
+
+                Log.d(TAG, "requestAudioFocusIfNeeded - granted=$hasAudioFocus")
+                if (!hasAudioFocus) {
+                    try {
+                        Log.w(
+                                TAG,
+                                "Audio focus denied — diagnostics: mode=${audioManager?.mode}, speaker=${audioManager?.isSpeakerphoneOn}, btSco=${audioManager?.isBluetoothScoOn}, btA2dp=${audioManager?.isBluetoothA2dpOn}, musicActive=${audioManager?.isMusicActive}, voiceVol=${audioManager?.getStreamVolume(AudioManager.STREAM_VOICE_CALL)}"
+                        )
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to print audio diagnostics", e)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "requestAudioFocusIfNeeded failed", e)
+            }
+        }
+
+        fun setSpeaker(enable: Boolean) {
+            speakerForcedByUser = enable
+            try {
+                val targetRoute =
+                        if (enable) {
+                            android.telecom.CallAudioState.ROUTE_SPEAKER
+                        } else {
+                            android.telecom.CallAudioState.ROUTE_EARPIECE
+                        }
+
+                // Call setAudioRoute on the service instance if available
+                // Works on API 23+ (Android 6.0+), deprecated but still functional on API 34+
+                instance?.let { service ->
+                    @Suppress("DEPRECATION") service.setAudioRoute(targetRoute)
+                    Log.d(
+                            TAG,
+                            "Used InCallService.setAudioRoute($targetRoute) for speaker=$enable (API ${Build.VERSION.SDK_INT})"
+                    )
+                    return
+                }
+
+                // Fallback to AudioManager for older devices or if service not available
+                val am = audioManager ?: return
+
+                // Request audio focus first - critical for speaker to work
+                requestAudioFocusIfNeeded()
+
+                // Set mode to IN_COMMUNICATION before setting speaker
+                am.mode = AudioManager.MODE_IN_COMMUNICATION
+
+                // If audio focus was denied, try aggressive fallback
+                if (!hasAudioFocus) {
+                    Log.d(TAG, "Audio focus not granted — running speaker fallback")
+
+                    // Stop Bluetooth SCO if active to force speaker routing
+                    try {
+                        @Suppress("DEPRECATION")
+                        if (am.isBluetoothScoOn) {
+                            Log.d(TAG, "Bluetooth SCO ON — stopping SCO to force speaker routing")
+                            @Suppress("DEPRECATION") am.stopBluetoothSco()
+                            am.setBluetoothScoOn(false)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed toggling Bluetooth SCO during fallback", e)
+                    }
+
+                    // Try setting speaker
+                    @Suppress("DEPRECATION") am.isSpeakerphoneOn = enable
+
+                    // If speaker state didn't take, try MODE_IN_CALL fallback
+                    @Suppress("DEPRECATION")
+                    if (am.isSpeakerphoneOn != enable) {
+                        Log.d(TAG, "Speaker state did not take — trying MODE_IN_CALL fallback")
+                        try {
+                            am.mode = AudioManager.MODE_IN_CALL
+                        } catch (_: Exception) {}
+                        @Suppress("DEPRECATION") am.isSpeakerphoneOn = enable
+                    }
+                } else {
+                    // Normal path with audio focus granted
+                    @Suppress("DEPRECATION") am.isSpeakerphoneOn = enable
+                }
+
+                @Suppress("DEPRECATION") val actualSpeaker = am.isSpeakerphoneOn
+                @Suppress("DEPRECATION") val actualBtSco = am.isBluetoothScoOn
+                Log.d(
+                        TAG,
+                        "setSpeaker -> $enable (mode=${am.mode}) speaker=$actualSpeaker btSco=$actualBtSco"
+                )
+                Log.d(TAG, "Requested speaker -> $enable (actual=$actualSpeaker)")
+            } catch (e: Exception) {
+                Log.w(TAG, "setSpeaker failed", e)
+            }
+        }
+
+        fun abandonAudioFocus() {
+            if (!hasAudioFocus || audioManager == null) return
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+                    audioFocusRequest = null
+                } else {
+                    audioManager?.abandonAudioFocus(afChangeListener)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "abandonAudioFocus failed", e)
+            } finally {
+                hasAudioFocus = false
+                Log.d(TAG, "abandonAudioFocus - released")
+            }
+        }
+
+        fun cancelNotification() {
+            instance?.cancelCallNotification()
+        }
+
+        fun setAudioRoute(route: Int) {
+            instance?.setAudioRoute(route)
+        }
+
+        /**
+         * Mark that the user initiated a disconnect/reject action for the given call.
+         */
+        fun markUserInitiatedDisconnect(call: Call?, source: String) {
+            val key = getCallKey(call)
+            if (key == null) {
+                synchronized(userDisconnectMarks) {
+                    globalUserDisconnectMarkAtMs = System.currentTimeMillis()
+                    pruneExpiredDisconnectMarksLocked()
+                }
+                Log.d(TAG, "Marked global local disconnect ($source): no call key")
+                return
+            }
+
+            synchronized(userDisconnectMarks) {
+                userDisconnectMarks[key] = System.currentTimeMillis()
+                pruneExpiredDisconnectMarksLocked()
+            }
+            Log.d(TAG, "Marked local disconnect ($source) for key=$key")
+        }
+
+        private fun consumeUserDisconnectMark(call: Call?): Boolean {
+            val now = System.currentTimeMillis()
+            val key = getCallKey(call)
+            synchronized(userDisconnectMarks) {
+                pruneExpiredDisconnectMarksLocked()
+
+                if (key != null) {
+                    val markedAt = userDisconnectMarks[key]
+                    if (markedAt != null) {
+                        val isRecent = now - markedAt <= LOCAL_DISCONNECT_MARK_VALIDITY_MS
+                        userDisconnectMarks.remove(key)
+                        if (isRecent) return true
+                    }
+                }
+
+                val globalMarkedRecent =
+                        globalUserDisconnectMarkAtMs > 0L &&
+                                now - globalUserDisconnectMarkAtMs <=
+                                        LOCAL_DISCONNECT_MARK_VALIDITY_MS
+                if (globalMarkedRecent) {
+                    globalUserDisconnectMarkAtMs = 0L
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun getCallKey(call: Call?): String? {
+            val details = call?.details ?: return null
+            val number = details.handle?.schemeSpecificPart ?: "unknown"
+            return "${details.creationTimeMillis}:$number"
+        }
+
+        private fun pruneExpiredDisconnectMarksLocked() {
+            val now = System.currentTimeMillis()
+            val iterator = userDisconnectMarks.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (now - entry.value > LOCAL_DISCONNECT_MARK_VALIDITY_MS) {
+                    iterator.remove()
+                }
+            }
+
+            if (globalUserDisconnectMarkAtMs > 0L &&
+                now - globalUserDisconnectMarkAtMs > LOCAL_DISCONNECT_MARK_VALIDITY_MS
+            ) {
+                globalUserDisconnectMarkAtMs = 0L
+            }
+        }
+
+        private fun mapDisconnectReason(code: Int): String {
+            return when (code) {
+                DisconnectCause.LOCAL -> "You (Local User)"
+                DisconnectCause.REMOTE -> "Other Party (Remote User)"
+                DisconnectCause.REJECTED -> "Call Rejected"
+                DisconnectCause.MISSED -> "Missed Call"
+                DisconnectCause.CANCELED -> "Call Canceled"
+                DisconnectCause.BUSY -> "Busy"
+                DisconnectCause.RESTRICTED -> "Restricted"
+                DisconnectCause.ERROR -> "Error"
+                DisconnectCause.UNKNOWN -> "Unknown"
+                else -> "Unknown ($code)"
+            }
+        }
+
+        private fun resolveDisconnectParty(causeCode: Int, localMarked: Boolean): String {
+            if (localMarked) return DISCONNECT_PARTY_LOCAL
+
+            // Strict rule: only explicit user button actions are local.
+            // All unmarked disconnects are treated as remote, regardless of framework cause code.
+            return DISCONNECT_PARTY_REMOTE
+        }
+
+        /**
+         * Add a call state listener. Multiple listeners are supported simultaneously.
+         * Each registered listener receives all callbacks independently.
+         */
+        fun addCallStateListener(listener: CallStateListener) {
+            synchronized(callStateListeners) {
+                if (!callStateListeners.contains(listener)) {
+                    callStateListeners.add(listener)
+                    Log.d(TAG, "Call state listener added (total=${callStateListeners.size})")
+                }
+            }
+        }
+
+        /**
+         * Remove a previously added listener. Other registered listeners are unaffected.
+         */
+        fun removeCallStateListener(listener: CallStateListener) {
+            synchronized(callStateListeners) {
+                callStateListeners.remove(listener)
+                Log.d(TAG, "Call state listener removed (total=${callStateListeners.size})")
+            }
+        }
+
+        /**
+         * Backward-compat: replaces all listeners with a single one.
+         * Prefer addCallStateListener for new code.
+         */
+        fun registerCallStateListener(listener: CallStateListener?) {
+            synchronized(callStateListeners) {
+                callStateListeners.clear()
+                if (listener != null) callStateListeners.add(listener)
+                Log.d(TAG, "Call state listener registered via legacy API (total=${callStateListeners.size})")
+            }
+        }
+
+        /**
+         * Backward-compat: removes all listeners.
+         * Prefer removeCallStateListener for new code.
+         */
+        fun unregisterCallStateListener() {
+            synchronized(callStateListeners) {
+                callStateListeners.clear()
+                Log.d(TAG, "All call state listeners unregistered")
+            }
+        }
+    }
+
+    // DISCONNECT_TRACKING: per-call snapshot and dynamic receiver
+    private var currentCallSnapshot: CallSnapshot? = null
+    private var callStateBeforeDisconnect: String = "unknown"
+    private var callTrackingReceiver: BroadcastReceiver? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        createNotificationChannel()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        cancelCallNotification()
+        instance = null
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel =
+                    NotificationChannel(
+                            "call_channel",
+                            "Call Notifications",
+                            NotificationManager.IMPORTANCE_HIGH
+                    )
+                            .apply { description = "Notifications for incoming and ongoing calls" }
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+            
+            // Channel for missed call notifications
+            val missedCallChannel = NotificationChannel(
+                "missed_call_channel",
+                "Missed Calls",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifications for missed calls"
+                enableVibration(false)
+            }
+            notificationManager.createNotificationChannel(missedCallChannel)
+        }
+    }
+
+    private val callCallback =
+            object : Call.Callback() {
+                override fun onStateChanged(call: Call?, state: Int) {
+                    super.onStateChanged(call, state)
+                    Log.d(TAG, "Call Callback: onStateChanged -> $state")
+                    updateCallNotification()
+
+                    when (state) {
+                        Call.STATE_DIALING -> {
+                            Log.d(TAG, "Call State: DIALING")
+                            launchCallScreen(call, "Dialing...")
+                        }
+                        Call.STATE_RINGING -> {
+                            Log.d(TAG, "Call State: RINGING")
+                            launchCallScreen(call, "Incoming call...")
+                            // DISCONNECT_TRACKING: mark ringing phase in snapshot
+                            currentCallSnapshot?.wasRinging = true
+                            callStateBeforeDisconnect = "RINGING"
+                        }
+                        Call.STATE_ACTIVE -> {
+                            Log.d(TAG, "Call State: ACTIVE")
+                            updateCallScreen(call, "Active")
+                            // Notify callback listener that call was answered
+                            invokeCallAnswered(call)
+                            // DISCONNECT_TRACKING: record active phase
+                            callStateBeforeDisconnect = "ACTIVE"
+                        }
+                        Call.STATE_DISCONNECTED -> {
+                            val disconnectCause = call?.details?.disconnectCause
+                            val disconnectCauseCode = disconnectCause?.code ?: DisconnectCause.UNKNOWN
+                            val localMarked = consumeUserDisconnectMark(call)
+                            val disconnectParty = resolveDisconnectParty(disconnectCauseCode, localMarked)
+
+                            callDisconnectedBy = mapDisconnectReason(disconnectCauseCode)
+                            lastDisconnectParty = disconnectParty
+                            lastDisconnectCauseCode = disconnectCauseCode
+                            // DISCONNECT_TRACKING: classify fine-grained reason from snapshot
+                            val snap = currentCallSnapshot ?: CallSnapshot()
+                            lastDisconnectReason = DisconnectReasonClassifier.classify(disconnectCauseCode, snap)
+                            lastCallStateAtEnd = callStateBeforeDisconnect
+                            lastAudioRouteAtEnd = snap.audioRoute
+                            lastSignalStrengthAtEnd = snap.signalStrength
+
+                            Log.d(
+                                TAG,
+                                "Call disconnected: reason=$callDisconnectedBy code=$disconnectCauseCode party=$disconnectParty " +
+                                "disconnectReason=${lastDisconnectReason} stateAtEnd=$lastCallStateAtEnd localMarked=$localMarked"
+                            )
+                            
+                            if (disconnectCauseCode == DisconnectCause.MISSED) {
+                                call?.let { showMissedCallNotification(it) }
+                            }
+                            // Do not relaunch the call UI on disconnected state. If no live calls
+                            // remain, the existing activity should close itself instead of showing
+                            // a stale disconnected screen.
+                            
+                            // Notify callback listener about call end with disconnect reason
+                            invokeCallEnded(call, callDisconnectedBy)
+                            
+                            call?.unregisterCallback(this)
+                            if (currentCall == call) {
+                                currentCall = getAllCalls().firstOrNull()
+                            }
+                            updateCallNotification()
+                        }
+                    }
+                }
+            }
+
+    override fun onCallAdded(call: Call?) {
+        super.onCallAdded(call)
+        instance = this
+        Log.d(TAG, "onCallAdded: state=${call?.state}")
+        
+        // Track the most recent call
+        currentCall = call
+        
+        // Reset per-call audio route tracking
+        speakerForcedByUser = false
+        initialRouteFixed = false
+        
+        try {
+            audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        } catch (_: Exception) {}
+        
+        // Hold any currently active call regardless of whether this is incoming or outgoing.
+        // For incoming (RINGING) calls this prevents OEM Telecom stacks (Xiaomi, Samsung, etc.)
+        // from disconnecting the active call instead of holding it when the user later answers.
+        val otherActiveCalls = getAllCalls().filter { it != call && it.state == Call.STATE_ACTIVE }
+        otherActiveCalls.forEach { it.hold() }
+
+        call?.registerCallback(callCallback)
+        updateCallNotification()
+
+        // Notify Flutter listener about the new call so it can log it immediately
+        val callDirection = when (call?.state) {
+            Call.STATE_RINGING -> "incoming"
+            Call.STATE_DIALING, Call.STATE_CONNECTING -> "outgoing"
+            else -> "unknown"
+        }
+        invokeCallAdded(call, callDirection)
+
+        // DISCONNECT_TRACKING: initialise snapshot and register event receivers for this call
+        val sigStrength = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                (getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager)
+                    .signalStrength?.level ?: -1
+            } else -1
+        } catch (_: Exception) { -1 }
+        currentCallSnapshot = CallSnapshot(
+            callDirection = callDirection,
+            signalStrength = sigStrength,
+            snapshotTimeMs = System.currentTimeMillis()
+        )
+        callStateBeforeDisconnect = "unknown"
+        if (callTrackingReceiver == null) {
+            callTrackingReceiver = object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    val s = currentCallSnapshot ?: return
+                    when (intent.action) {
+                        Intent.ACTION_SCREEN_OFF -> {
+                            s.screenWasOff = true
+                            s.powerKeyPressed = true
+                            Log.d(TAG, "DISCONNECT_TRACKING: screen off during call")
+                        }
+                        Intent.ACTION_AIRPLANE_MODE_CHANGED -> {
+                            if (intent.getBooleanExtra("state", false)) {
+                                s.airplaneModeOn = true
+                                Log.d(TAG, "DISCONNECT_TRACKING: airplane mode on during call")
+                            }
+                        }
+                        "android.telephony.action.SIM_CARD_STATE_CHANGED" -> {
+                            val simState = intent.getIntExtra(
+                                "android.telephony.extra.SIM_STATE",
+                                TelephonyManager.SIM_STATE_UNKNOWN
+                            )
+                            if (simState == TelephonyManager.SIM_STATE_ABSENT) {
+                                s.simRemoved = true
+                                Log.d(TAG, "DISCONNECT_TRACKING: SIM removed during call")
+                            }
+                        }
+                        BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                            s.bluetoothLostJustBefore = true
+                            try {
+                                s.bluetoothDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    intent.getParcelableExtra(
+                                        BluetoothDevice.EXTRA_DEVICE,
+                                        BluetoothDevice::class.java
+                                    )
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                                }
+                            } catch (_: Exception) {}
+                            Log.d(TAG, "DISCONNECT_TRACKING: Bluetooth ACL disconnected during call")
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED)
+                addAction("android.telephony.action.SIM_CARD_STATE_CHANGED")
+                addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(callTrackingReceiver, filter, Context.RECEIVER_EXPORTED)
+                } else {
+                    registerReceiver(callTrackingReceiver, filter)
+                }
+                Log.d(TAG, "DISCONNECT_TRACKING: call-context receivers registered")
+            } catch (e: Exception) {
+                Log.w(TAG, "DISCONNECT_TRACKING: failed to register receivers", e)
+            }
+        }
+
+        // Launch call screen for new calls if it's not already showing or if it's incoming
+        if (call?.state == Call.STATE_RINGING) {
+            launchCallScreen(call, "Incoming call...")
+        } else if (call?.state == Call.STATE_DIALING || call?.state == Call.STATE_CONNECTING) {
+            launchCallScreen(call, "Dialing...")
+        }
+    }
+
+    override fun onCallRemoved(call: Call?) {
+        super.onCallRemoved(call)
+        Log.d(TAG, "onCallRemoved")
+        call?.unregisterCallback(callCallback)
+        if (currentCall == call) {
+            currentCall = getAllCalls().firstOrNull()
+        }
+        updateCallNotification()
+        // DISCONNECT_TRACKING: unregister receivers once no calls remain
+        if (getAllCalls().isEmpty()) {
+            callTrackingReceiver?.let {
+                try { unregisterReceiver(it) } catch (_: Exception) {}
+                callTrackingReceiver = null
+                Log.d(TAG, "DISCONNECT_TRACKING: call-context receivers unregistered")
+            }
+        }
+    }
+
+    override fun onCallAudioStateChanged(audioState: android.telecom.CallAudioState?) {
+        super.onCallAudioStateChanged(audioState)
+        audioState?.let {
+            // Some OEMs (e.g. Motorola Android 11) silently route audio to SPEAKER when a
+            // call is placed via TelecomManager from a non-default-dialer app. Detect this
+            // and immediately switch back to earpiece if the user never requested speaker.
+            if (!initialRouteFixed && !speakerForcedByUser &&
+                it.route == android.telecom.CallAudioState.ROUTE_SPEAKER) {
+                Log.d(TAG, "onCallAudioStateChanged: OEM forced SPEAKER without user request — routing to EARPIECE")
+                instance?.setAudioRoute(android.telecom.CallAudioState.ROUTE_EARPIECE)
+            }
+            if (!initialRouteFixed) {
+                initialRouteFixed = true
+            }
+
+            val intent = Intent(ACTION_AUDIO_STATE_CHANGED).apply {
+                putExtra(EXTRA_AUDIO_STATE, it)
+                setPackage(packageName)
+            }
+            sendBroadcast(intent)
+            // DISCONNECT_TRACKING: keep snapshot audio route current
+            currentCallSnapshot?.audioRoute = it.route
+        }
+    }
+
+    /**
+     * Primary logic to update the ongoing notification based on all active calls.
+     */
+    private fun updateCallNotification() {
+        val allCalls = getAllCalls()
+        Log.d(TAG, "updateCallNotification: ${allCalls.size} calls")
+
+        if (allCalls.isEmpty()) {
+            cancelCallNotification()
+            return
+        }
+
+        // Determine which call to show as primary in the notification
+        // Priority: RINGING > ACTIVE > DIALING > HOLDING
+        val ringingCall = allCalls.find { it.state == Call.STATE_RINGING }
+        val activeCall = allCalls.find { it.state == Call.STATE_ACTIVE }
+        val dialingCall = allCalls.find { it.state == Call.STATE_DIALING || it.state == Call.STATE_CONNECTING }
+        val holdingCall = allCalls.find { it.state == Call.STATE_HOLDING }
+
+        val primaryCall = ringingCall ?: activeCall ?: dialingCall ?: holdingCall ?: allCalls.firstOrNull()
+        if (primaryCall == null) {
+            cancelCallNotification()
+            return
+        }
+        currentCall = primaryCall
+        
+        if (ringingCall != null) {
+            showIncomingCallNotification(ringingCall)
+        } else {
+            showOngoingCallNotification(primaryCall, allCalls)
+        }
+    }
+
+    private fun showIncomingCallNotification(call: Call) {
+        val phoneNumber = call.details.handle?.schemeSpecificPart ?: "Unknown"
+        val contactName = getContactName(phoneNumber) ?: phoneNumber
+
+        val fullScreenIntent = Intent(this, CallScreenActivity::class.java).apply {
+            putExtra("PHONE_NUMBER", phoneNumber)
+            putExtra("CALL_STATE", "Incoming")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this, 0, fullScreenIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val acceptPendingIntent = PendingIntent.getBroadcast(
+            this, 1, Intent(this, CallActionReceiver::class.java).apply { action = "ACCEPT_CALL" },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val rejectPendingIntent = PendingIntent.getBroadcast(
+            this, 2, Intent(this, CallActionReceiver::class.java).apply { action = "REJECT_CALL" },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val caller = Person.Builder().setName(contactName).build()
+
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Notification.Builder(this, "call_channel")
+                .setSmallIcon(android.R.drawable.sym_call_incoming)
+                .setStyle(Notification.CallStyle.forIncomingCall(caller, rejectPendingIntent, acceptPendingIntent))
+                .setFullScreenIntent(fullScreenPendingIntent, true)
+                .setOngoing(true)
+                .setCategory(Notification.CATEGORY_CALL)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .build()
+        } else {
+            NotificationCompat.Builder(this, "call_channel")
+                .setSmallIcon(android.R.drawable.sym_call_incoming)
+                .setContentTitle("Incoming Call")
+                .setContentText(contactName)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Reject", rejectPendingIntent)
+                .addAction(android.R.drawable.ic_menu_call, "Accept", acceptPendingIntent)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setFullScreenIntent(fullScreenPendingIntent, true)
+                .setOngoing(true)
+                .build()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, getForegroundServiceTypeCompat())
+        } else {
+            startForeground(1, notification)
+        }
+    }
+
+    private fun showOngoingCallNotification(primaryCall: Call, allCalls: List<Call>) {
+        val phoneNumber = primaryCall.details.handle?.schemeSpecificPart ?: "Unknown"
+        val contactName = getContactName(phoneNumber) ?: phoneNumber
+        
+        // Multi-call info text
+        val contentText = if (allCalls.size > 1) {
+            val otherCount = allCalls.size - 1
+            "$contactName (and $otherCount other call${if (otherCount > 1) "s" else ""})"
+        } else {
+            contactName
+        }
+
+        val returnIntent = Intent(this, CallScreenActivity::class.java).apply {
+            putExtra("PHONE_NUMBER", phoneNumber)
+            putExtra("CALL_STATE", when(primaryCall.state) {
+                Call.STATE_ACTIVE -> "Active"
+                Call.STATE_DIALING, Call.STATE_CONNECTING -> "Dialing"
+                Call.STATE_HOLDING -> "On Hold"
+                else -> "Active"
+            })
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val returnPendingIntent = PendingIntent.getActivity(
+            this, 3, returnIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val hangupPendingIntent = PendingIntent.getBroadcast(
+            this, 4, Intent(this, CallActionReceiver::class.java).apply { action = "HANGUP_CALL" },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val caller = Person.Builder().setName(contactName).build()
+
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Notification.Builder(this, "call_channel")
+                .setSmallIcon(android.R.drawable.sym_call_outgoing)
+                .setStyle(Notification.CallStyle.forOngoingCall(caller, hangupPendingIntent))
+                .setContentTitle(if (primaryCall.state == Call.STATE_ACTIVE) "Ongoing Call" else "Dialing...")
+                .setContentText(contentText)
+                .setContentIntent(returnPendingIntent)
+                .setOngoing(true)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .apply {
+                    if (primaryCall.state == Call.STATE_ACTIVE) {
+                        setUsesChronometer(true)
+                        setWhen(primaryCall.details.connectTimeMillis)
+                    }
+                }
+                .build()
+        } else {
+            NotificationCompat.Builder(this, "call_channel")
+                .setSmallIcon(android.R.drawable.sym_call_outgoing)
+                .setContentTitle(if (primaryCall.state == Call.STATE_ACTIVE) "Ongoing Call" else "Dialing...")
+                .setContentText(contentText)
+                .setContentIntent(returnPendingIntent)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hangup", hangupPendingIntent)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setOngoing(true)
+                .apply {
+                    if (primaryCall.state == Call.STATE_ACTIVE) {
+                        setUsesChronometer(true)
+                        setWhen(primaryCall.details.connectTimeMillis)
+                    }
+                }
+                .build()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, getForegroundServiceTypeCompat())
+        } else {
+            startForeground(1, notification)
+        }
+    }
+
+    private fun getForegroundServiceTypeCompat(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+        }
+    }
+
+    private fun cancelCallNotification() {
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.cancel(1)
+        stopForeground(Service.STOP_FOREGROUND_REMOVE)
+    }
+
+    private fun showMissedCallNotification(call: Call) {
+        val phoneNumber = call.details.handle?.schemeSpecificPart ?: "Unknown"
+        val openHistoryIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        } ?: return
+        val openHistoryPendingIntent = PendingIntent.getActivity(
+            this, 100, openHistoryIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val callBackIntent = Intent(Intent.ACTION_CALL).apply {
+            data = android.net.Uri.parse("tel:$phoneNumber")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val callBackPendingIntent = PendingIntent.getActivity(
+            this, 101, callBackIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, "missed_call_channel")
+            .setSmallIcon(android.R.drawable.stat_notify_missed_call)
+            .setContentTitle("Missed Call")
+            .setContentText("Missed call from $phoneNumber")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setContentIntent(openHistoryPendingIntent)
+            .setAutoCancel(true)
+            .addAction(android.R.drawable.sym_action_call, "Call Back", callBackPendingIntent)
+            .build()
+
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(2, notification)
+    }
+
+    private fun launchCallScreen(call: Call?, callState: String) {
+        var phoneNumber = call?.details?.handle?.schemeSpecificPart
+        if (phoneNumber.isNullOrEmpty() || phoneNumber == "Unknown") {
+            try {
+                val extras = call?.details?.intentExtras
+                val fromTelecom = extras?.getString("android.telecom.extra.INCOMING_NUMBER")
+                phoneNumber = if (!fromTelecom.isNullOrEmpty()) fromTelecom
+                else call?.details?.handle?.toString()?.substringAfter("tel:")?.substringBefore("@") ?: "Unknown"
+            } catch (_: Exception) {
+                phoneNumber = call?.details?.handle?.toString()?.substringAfter("tel:")?.substringBefore("@") ?: "Unknown"
+            }
+        }
+        phoneNumber = phoneNumber.replace(" ", "").replace("-", "")
+        showCallScreen(phoneNumber, callState, canConference = false, canMerge = false)
+    }
+
+    private fun updateCallScreen(call: Call?, callState: String) {
+        if (callState.contains("Active", ignoreCase = true)) {
+            var phoneNumber = call?.details?.handle?.schemeSpecificPart
+            if (phoneNumber.isNullOrEmpty() || phoneNumber == "Unknown") {
+                try {
+                    val extras = call?.details?.intentExtras
+                    val fromTelecom = extras?.getString("android.telecom.extra.INCOMING_NUMBER")
+                    phoneNumber = if (!fromTelecom.isNullOrEmpty()) fromTelecom
+                    else call?.details?.handle?.toString()?.substringAfter("tel:")?.substringBefore("@") ?: "Unknown"
+                } catch (_: Exception) {
+                    phoneNumber = call?.details?.handle?.toString()?.substringAfter("tel:")?.substringBefore("@") ?: "Unknown"
+                }
+            }
+            showCallScreen(phoneNumber, callState, canConference = true, canMerge = true)
+        }
+    }
+
+    private fun showCallScreen(phoneNumber: String, callState: String, canConference: Boolean, canMerge: Boolean) {
+        val intent = Intent(this, CallScreenActivity::class.java).apply {
+            putExtra("PHONE_NUMBER", phoneNumber)
+            putExtra("CALL_STATE", callState)
+            putExtra(CallScreenActivity.EXTRA_CAN_CONFERENCE, canConference)
+            putExtra(CallScreenActivity.EXTRA_CAN_MERGE, canMerge)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+        }
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start/update call screen", e)
+        }
+    }
+
+    private fun getContactName(phoneNumber: String): String? {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
+        val uri = ContactsContract.PhoneLookup.CONTENT_FILTER_URI.buildUpon().appendPath(phoneNumber).build()
+        var contactName: String? = null
+        val cursor = contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                contactName = it.getString(0)
+            }
+        }
+        return contactName
+    }
+
+    /**
+     * Invoke the call added callback on the registered listener.
+     * Called as soon as onCallAdded fires so Flutter can create a log entry immediately.
+     */
+    private fun invokeCallAdded(call: Call?, callDirection: String) {
+        try {
+            val phoneNumber = call?.details?.handle?.schemeSpecificPart ?: return
+            Log.d(TAG, "Invoking callback: call added for $phoneNumber ($callDirection)")
+            val snapshot: List<CallStateListener>
+            synchronized(callStateListeners) { snapshot = callStateListeners.toList() }
+            snapshot.forEach { it.onCallAdded(phoneNumber, callDirection) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to invoke call added callback", e)
+        }
+    }
+
+    /**
+     * Invoke the call answered callback on all registered listeners.
+     */
+    private fun invokeCallAnswered(call: Call?) {
+        try {
+            val phoneNumber = call?.details?.handle?.schemeSpecificPart ?: return
+            val callStartTime = call?.details?.connectTimeMillis
+                ?: call?.details?.creationTimeMillis
+                ?: System.currentTimeMillis()
+            Log.d(TAG, "Invoking callback: call answered for $phoneNumber")
+            val snapshot: List<CallStateListener>
+            synchronized(callStateListeners) { snapshot = callStateListeners.toList() }
+            snapshot.forEach { it.onCallAnswered(phoneNumber, "unknown", callStartTime) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to invoke call answered callback", e)
+        }
+    }
+
+    /**
+     * Invoke the call ended callback on all registered listeners.
+     */
+    private fun invokeCallEnded(call: Call?, disconnectReason: String) {
+        try {
+            val phoneNumber = call?.details?.handle?.schemeSpecificPart ?: return
+            val disconnectCauseCode = call?.details?.disconnectCause?.code ?: DisconnectCause.UNKNOWN
+            Log.d(TAG, "Invoking callback: call ended for $phoneNumber, reason: $disconnectReason")
+            val snapshot: List<CallStateListener>
+            synchronized(callStateListeners) { snapshot = callStateListeners.toList() }
+            snapshot.forEach { it.onCallEnded(phoneNumber, "unknown", disconnectReason, disconnectCauseCode) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to invoke call ended callback", e)
+        }
+    }
+}

@@ -57,6 +57,14 @@ class RiskEngine:
         self._current_level = RiskLevel.LOW
         self._consecutive_elevated = 0
 
+    def decay_on_silence(self, step: int = 1):
+        """Apply evidence decay and silence de-escalation when speech is absent."""
+        if self._consecutive_elevated > 0:
+            self._consecutive_elevated = max(0, self._consecutive_elevated - step)
+        # If no elevated windows remain, de-escalate towards LOW
+        if self._consecutive_elevated == 0 and self._current_level != RiskLevel.LOW:
+            self._current_level = RiskLevel.LOW
+
     def assess_single(
         self,
         spoof: SpoofResult,
@@ -88,6 +96,7 @@ class RiskEngine:
         self,
         spoof_results: list[SpoofResult],
         speaker_results: list[Optional[SpeakerResult]] = None,
+        matched_speaker_name: Optional[str] = None,
     ) -> RiskAssessment:
         """Assess risk for a complete recording (multiple segments)."""
         if not spoof_results:
@@ -143,7 +152,8 @@ class RiskEngine:
 
         reason = self._generate_aggregate_reason(
             avg_spoof, max_spoof, avg_speaker, risk_level,
-            len(spoof_results), suspicious_count
+            len(spoof_results), suspicious_count,
+            matched_speaker_name=matched_speaker_name,
         )
 
         return RiskAssessment(
@@ -273,25 +283,15 @@ class RiskEngine:
         spoof_score: float,
         speaker_similarity: Optional[float] = None,
     ) -> float:
-        """Compute a 0-1 risk score from spoof and speaker similarity.
+        """Compute a 0-1 risk score strictly from spoof detection evidence.
 
-        Speaker factor only increases risk when spoof score is already
-        elevated (>0.3). This avoids false positives from genuine voices
-        that happen to have low speaker match.
+        SECURITY INVARIANT:
+        'Whose voice does this resemble?' != 'Is this voice authentic?'
+        Speaker resemblance must NEVER suppress or downgrade spoof risk.
+        An AI-cloned voice of an enrolled speaker will have high speaker similarity
+        and high spoof risk -> The final risk score must remain elevated.
         """
-        # Base risk from spoof score
         risk = spoof_score
-
-        # Adjust based on speaker similarity ONLY when spoof is already suspicious
-        if speaker_similarity is not None and spoof_score > 0.3:
-            # Low speaker match amplifies existing suspicion
-            speaker_factor = 1.0 - speaker_similarity  # 0=perfect match, 1=no match
-            # Blend: spoof dominates, speaker provides amplification
-            risk = spoof_score * 0.7 + (spoof_score * speaker_factor) * 0.3
-        elif speaker_similarity is not None and speaker_similarity > 0.7:
-            # High speaker match slightly reduces risk even at low spoof
-            risk = spoof_score * 0.9
-
         return min(max(risk, 0.0), 1.0)
 
     def _score_to_level(self, risk_score: float) -> RiskLevel:
@@ -320,30 +320,43 @@ class RiskEngine:
         speaker: Optional[SpeakerResult],
         level: RiskLevel,
         decision: Decision = Decision.SAFE,
+        speaker_name: Optional[str] = None,
     ) -> str:
-        """Generate a human-readable reason for the risk assessment."""
-        parts = []
+        """Generate a human-readable reason for the risk assessment.
 
-        if level == RiskLevel.CRITICAL:
-            parts.append("High probability of synthetic/cloned voice detected.")
-        elif level == RiskLevel.HIGH:
-            parts.append("Elevated synthetic voice indicators detected.")
+        Explicitly articulates the orthogonal signals of speaker resemblance
+        and voice authenticity.
+        """
+        parts = []
+        name_str = speaker_name or (f"ID {speaker.enrolled_speaker_id}" if speaker and speaker.enrolled_speaker_id else "enrolled speaker")
+
+        is_synthetic = level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+        has_speaker_match = speaker is not None and (speaker.match or speaker.speaker_similarity >= settings.speaker_threshold_match)
+
+        if is_synthetic and has_speaker_match:
+            parts.append(f"Audio resembles {name_str}, but synthetic-voice indicators are detected.")
+        elif is_synthetic:
+            parts.append("Elevated synthetic voice indicators detected; no confident enrolled match.")
         elif level == RiskLevel.MEDIUM:
-            parts.append("Moderate synthetic voice indicators present.")
+            if has_speaker_match:
+                parts.append(f"Audio resembles {name_str}, with moderate synthetic voice indicators under observation.")
+            else:
+                parts.append("Moderate synthetic voice indicators present.")
         elif decision == Decision.MONITOR:
             parts.append("Potential synthetic voice anomaly under observation.")
         else:
-            parts.append("Voice appears authentic.")
+            if has_speaker_match:
+                parts.append(f"Voice matches {name_str} with authentic voice characteristics.")
+            else:
+                parts.append("Voice appears authentic.")
 
         parts.append(f"Raw spoof score: {spoof.spoof_score:.1%}")
 
         if speaker is not None:
-            if speaker.match:
-                parts.append(f"Speaker match: {speaker.speaker_similarity:.0%} (matches enrolled profile)")
-            else:
-                parts.append(f"Speaker match: {speaker.speaker_similarity:.0%} (does NOT match enrolled profile)")
+            status_text = "matches enrolled profile" if speaker.match else "does NOT match enrolled profile"
+            parts.append(f"Speaker similarity: {speaker.speaker_similarity:.2f} ({status_text})")
 
-        # Only emit sustained alert when level is genuinely elevated (never when SAFE!)
+        # Sustained alert when level is genuinely elevated
         if level in (RiskLevel.HIGH, RiskLevel.CRITICAL) and self._consecutive_elevated > 1:
             parts.append(
                 f"Sustained alert: {self._consecutive_elevated} consecutive elevated windows."
@@ -363,23 +376,34 @@ class RiskEngine:
         level: RiskLevel,
         total_segments: int,
         suspicious_segments: int,
+        matched_speaker_name: Optional[str] = None,
     ) -> str:
         """Generate reason for aggregate (recorded) assessment."""
         parts = []
+        is_synthetic = level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+        has_speaker_match = avg_speaker is not None and avg_speaker >= settings.speaker_threshold_match
+        name_str = matched_speaker_name or "enrolled speaker"
 
-        if level == RiskLevel.CRITICAL:
-            parts.append("Recording contains strong synthetic voice characteristics.")
-        elif level == RiskLevel.HIGH:
+        if is_synthetic and has_speaker_match:
+            parts.append(f"Audio resembles enrolled speaker {name_str}, but synthetic-voice indicators are detected.")
+        elif is_synthetic:
             parts.append("Recording shows elevated synthetic voice indicators.")
         elif level == RiskLevel.MEDIUM:
-            parts.append("Recording has moderate synthetic indicators in some segments.")
+            if has_speaker_match:
+                parts.append(f"Recording resembles {name_str}, with moderate synthetic indicators in some segments.")
+            else:
+                parts.append("Recording has moderate synthetic indicators in some segments.")
         else:
-            parts.append("Recording appears to contain authentic speech.")
+            if has_speaker_match:
+                parts.append(f"Recording matches enrolled speaker {name_str} with authentic speech characteristics.")
+            else:
+                parts.append("Recording appears to contain authentic speech.")
 
         parts.append(f"Average spoof score: {avg_spoof:.0%}, peak: {max_spoof:.0%}.")
         parts.append(f"{suspicious_segments}/{total_segments} segments flagged as suspicious.")
 
         if avg_speaker is not None:
-            parts.append(f"Average speaker similarity: {avg_speaker:.0%}.")
+            parts.append(f"Speaker similarity: {avg_speaker:.2f}.")
 
         return " ".join(parts)
+

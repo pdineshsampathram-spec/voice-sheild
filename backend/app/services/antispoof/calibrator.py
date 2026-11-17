@@ -33,9 +33,10 @@ class CalibratedOutput:
     raw_spoof_score: float
     raw_logit_spoof: float
     raw_logit_bonafide: float
-    calibrated_probability: Optional[float]  # None if uncalibrated
-    decision: str                            # "UNCALIBRATED", "GENUINE", "SUSPICIOUS", "UNCERTAIN"
-    calibration_status: str                  # "CALIBRATION_REQUIRED", "CALIBRATED"
+    delta: float                             # Raw logit margin: logit_spoof - logit_bonafide
+    calibrated_probability: Optional[float]  # None if uncalibrated / invalid / abstained
+    decision: str                            # "UNCALIBRATED", "GENUINE", "SUSPICIOUS", "UNCERTAIN", "ABSTAIN", "INVALID"
+    calibration_status: str                  # "CALIBRATION_REQUIRED", "CALIBRATED", "NOT_VALID", "INSUFFICIENT_AUDIO_QUALITY", "NOT_APPLICABLE_SILENCE"
     calibration_version: str
     calibration_method: str                  # "platt", "isotonic", "none"
     operating_threshold: Optional[float]
@@ -52,15 +53,21 @@ class ScoreCalibrator:
         artifact_path: Optional[Union[str, Path]] = None,
         expected_model: str = "Spectra-AASIST",
         expected_domain: str = "webrtc_opus",
+        expected_score_representation: str = "logit_margin_delta",
     ):
         self.expected_model = expected_model
         self.expected_domain = expected_domain
+        self.expected_score_representation = expected_score_representation
+        self.score_representation = expected_score_representation
         self.is_loaded = False
         self.version = "uncalibrated"
         self.method = "none"
         self.domain = "unknown"
         self.operating_threshold = 0.5
         self.eer = 0.0
+        self.quality_gate_rms = 0.0042
+
+        self._status: str = "UNCALIBRATED"
 
         # Platt scaling parameters: logit(p) = a * score + b
         self._platt_a: float = 1.0
@@ -73,12 +80,18 @@ class ScoreCalibrator:
         if artifact_path:
             self.load(artifact_path)
 
+    @property
+    def status(self) -> str:
+        """Return the explicit calibration state: CALIBRATED, UNCALIBRATED, CALIBRATION_UNAVAILABLE, CALIBRATION_INVALID."""
+        return self._status
+
     def load(self, path: Union[str, Path]) -> bool:
         """Load calibration artifact JSON with domain and model version validation."""
         path = Path(path)
         if not path.exists():
             logger.warning(f"Calibration artifact not found: {path}. Calibration REQUIRED.")
             self.is_loaded = False
+            self._status = "UNCALIBRATED"
             return False
 
         try:
@@ -88,29 +101,42 @@ class ScoreCalibrator:
             # Validate model and domain compatibility
             artifact_model = data.get("model", "")
             artifact_domain = data.get("domain", "")
+            artifact_rep = data.get("score_representation", "logit_margin_delta")
 
             if artifact_model != self.expected_model:
                 logger.warning(
                     f"Calibration model mismatch: artifact has '{artifact_model}', "
-                    f"expected '{self.expected_model}'. Calibration marked REQUIRED."
+                    f"expected '{self.expected_model}'. Calibration marked INVALID."
                 )
                 self.is_loaded = False
+                self._status = "CALIBRATION_INVALID"
                 return False
 
             if artifact_domain != self.expected_domain and self.expected_domain != "any":
                 logger.warning(
                     f"Calibration domain mismatch: artifact trained for '{artifact_domain}', "
-                    f"evaluated in '{self.expected_domain}'. Calibration marked REQUIRED."
+                    f"evaluated in '{self.expected_domain}'. Calibration marked INVALID."
                 )
                 self.is_loaded = False
+                self._status = "CALIBRATION_INVALID"
+                return False
+
+            if artifact_rep != self.expected_score_representation:
+                logger.warning(
+                    f"Calibration representation mismatch: artifact has '{artifact_rep}', "
+                    f"expected '{self.expected_score_representation}'. Calibration marked INVALID."
+                )
+                self.is_loaded = False
+                self._status = "CALIBRATION_INVALID"
                 return False
 
             self.version = data.get("version", "v1.0")
             self.method = data.get("method", "platt")
             self.domain = artifact_domain
+            self.score_representation = artifact_rep
             self.operating_threshold = float(data.get("operating_threshold", 0.5))
             self.eer = float(data.get("validation_eer", 0.0))
-            self.quality_gate_rms = float(data.get("metadata", {}).get("quality_gate_rms", 0.0025))
+            self.quality_gate_rms = float(data.get("metadata", {}).get("quality_gate_rms", 0.0042))
 
             if self.method == "platt":
                 self._platt_a = float(data["params"]["a"])
@@ -120,15 +146,22 @@ class ScoreCalibrator:
                 self._isotonic_y = data["params"]["y"]
 
             self.is_loaded = True
+            self._status = "CALIBRATED"
             logger.info(
                 f"ScoreCalibrator: loaded {self.version} ({self.method}) "
                 f"for domain '{self.domain}' (op_thresh={self.operating_threshold:.3f}, gate_rms={self.quality_gate_rms:.4f})"
             )
             return True
 
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to parse calibration artifact {path}: {e}")
+            self.is_loaded = False
+            self._status = "CALIBRATION_INVALID"
+            return False
         except Exception as e:
             logger.error(f"Failed to load calibration artifact {path}: {e}")
             self.is_loaded = False
+            self._status = "CALIBRATION_UNAVAILABLE"
             return False
 
     def save(self, path: Union[str, Path], metadata: Optional[dict] = None):
@@ -141,6 +174,7 @@ class ScoreCalibrator:
             "version": self.version,
             "method": self.method,
             "domain": self.domain,
+            "score_representation": self.score_representation,
             "operating_threshold": self.operating_threshold,
             "validation_eer": self.eer,
             "params": {},
@@ -164,6 +198,7 @@ class ScoreCalibrator:
         method: str = "platt",
         domain: str = "webrtc_opus",
         version: str = "v1.0",
+        score_representation: str = "raw_score",
     ):
         """Fit calibration mapping and find operating point ONLY on validation split."""
         from sklearn.linear_model import LogisticRegression
@@ -176,6 +211,7 @@ class ScoreCalibrator:
         self.method = method
         self.domain = domain
         self.version = version
+        self.score_representation = score_representation
 
         # 1. Fit probability calibration
         if method == "platt":
@@ -212,16 +248,23 @@ class ScoreCalibrator:
         raw_spoof_score: float,
         raw_logit_spoof: float = 0.0,
         raw_logit_bonafide: float = 0.0,
+        delta: Optional[float] = None,
         window_valid: bool = True,
         invalidation_reason: str = "",
         rms: Optional[float] = None,
+        audio_domain: str = "webrtc_opus",
+        is_silence: bool = False,
     ) -> CalibratedOutput:
         """Produce calibrated output or explicitly declare CALIBRATION_REQUIRED or ABSTAIN."""
+        if delta is None:
+            delta = raw_logit_spoof - raw_logit_bonafide
+
         if not window_valid:
             return CalibratedOutput(
                 raw_spoof_score=round(raw_spoof_score, 4),
                 raw_logit_spoof=round(raw_logit_spoof, 4),
                 raw_logit_bonafide=round(raw_logit_bonafide, 4),
+                delta=round(delta, 4),
                 calibrated_probability=None,
                 decision="INVALID",
                 calibration_status="INVALID_WINDOW",
@@ -233,15 +276,34 @@ class ScoreCalibrator:
                 invalidation_reason=invalidation_reason or "AUDIO_DISCONTINUITY",
             )
 
-        # QUALITY-AWARE ABSTENTION: Insufficient acoustic energy / empty silence
+        # 1. FIRST-CLASS SILENCE HANDLING (Clean separation from audio quality failure)
+        if is_silence:
+            return CalibratedOutput(
+                raw_spoof_score=round(raw_spoof_score, 4),
+                raw_logit_spoof=round(raw_logit_spoof, 4),
+                raw_logit_bonafide=round(raw_logit_bonafide, 4),
+                delta=round(delta, 4),
+                calibrated_probability=None,
+                decision="ABSTAIN",
+                calibration_status="NOT_APPLICABLE_SILENCE",
+                calibration_version=self.version,
+                calibration_method=self.method,
+                operating_threshold=round(self.operating_threshold, 4) if self.is_loaded else None,
+                target_domain=self.domain,
+                is_valid=False,
+                invalidation_reason=invalidation_reason or "SILENCE_NO_SPEECH",
+            )
+
+        # 2. QUALITY-AWARE ABSTENTION: Insufficient acoustic energy / empty silence
         # Low-information audio produces biased uncalibrated spoof outputs.
         # Quality Gate threshold is derived on validation data and frozen in calibration artifact.
-        gate_rms = getattr(self, "quality_gate_rms", 0.0025)
+        gate_rms = getattr(self, "quality_gate_rms", 0.0042)
         if rms is not None and rms < gate_rms:
             return CalibratedOutput(
                 raw_spoof_score=round(raw_spoof_score, 4),
                 raw_logit_spoof=round(raw_logit_spoof, 4),
                 raw_logit_bonafide=round(raw_logit_bonafide, 4),
+                delta=round(delta, 4),
                 calibrated_probability=None,
                 decision="ABSTAIN",
                 calibration_status="INSUFFICIENT_AUDIO_QUALITY",
@@ -253,12 +315,14 @@ class ScoreCalibrator:
                 invalidation_reason=f"QUALITY_GATE: Low RMS ({rms:.5f} < {gate_rms:.4f})",
             )
 
+        # 3. Model calibration availability check
         if not self.is_loaded:
             # RULE 1 & 3: Never fabricate a spoof probability without calibration!
             return CalibratedOutput(
                 raw_spoof_score=round(raw_spoof_score, 4),
                 raw_logit_spoof=round(raw_logit_spoof, 4),
                 raw_logit_bonafide=round(raw_logit_bonafide, 4),
+                delta=round(delta, 4),
                 calibrated_probability=None,
                 decision="UNCALIBRATED",
                 calibration_status="CALIBRATION_REQUIRED",
@@ -269,16 +333,42 @@ class ScoreCalibrator:
                 is_valid=True,
             )
 
-        # Apply calibration mapping
+        # 4. Domain validity contract check
+        if audio_domain != self.domain and self.domain != "any":
+            return CalibratedOutput(
+                raw_spoof_score=round(raw_spoof_score, 4),
+                raw_logit_spoof=round(raw_logit_spoof, 4),
+                raw_logit_bonafide=round(raw_logit_bonafide, 4),
+                delta=round(delta, 4),
+                calibrated_probability=None,
+                decision="UNCALIBRATED",
+                calibration_status="NOT_VALID",
+                calibration_version=self.version,
+                calibration_method=self.method,
+                operating_threshold=None,
+                target_domain=self.domain,
+                is_valid=False,
+                invalidation_reason=f"DOMAIN_MISMATCH: Input audio '{audio_domain}' != calibrated domain '{self.domain}'",
+            )
+
+        # 5. Apply validated calibration mapping
+        # Support logit_margin_delta when available/expected, else fall back to raw score
+        if self.score_representation == "logit_margin_delta" and (
+            delta is not None and (raw_logit_spoof != 0.0 or raw_logit_bonafide != 0.0 or delta != 0.0)
+        ):
+            score_to_calibrate = delta
+        else:
+            score_to_calibrate = raw_spoof_score
+
         if self.method == "platt":
-            z = self._platt_a * raw_spoof_score + self._platt_b
+            z = self._platt_a * score_to_calibrate + self._platt_b
             calibrated_prob = float(1.0 / (1.0 + np.exp(-z)))
         elif self.method == "isotonic":
             calibrated_prob = float(np.interp(
-                raw_spoof_score, self._isotonic_x, self._isotonic_y
+                score_to_calibrate, self._isotonic_x, self._isotonic_y
             ))
         else:
-            calibrated_prob = raw_spoof_score
+            calibrated_prob = score_to_calibrate
 
         # Operating decision based on validated threshold
         if calibrated_prob >= self.operating_threshold:
@@ -292,6 +382,7 @@ class ScoreCalibrator:
             raw_spoof_score=round(raw_spoof_score, 4),
             raw_logit_spoof=round(raw_logit_spoof, 4),
             raw_logit_bonafide=round(raw_logit_bonafide, 4),
+            delta=round(delta, 4),
             calibrated_probability=round(calibrated_prob, 4),
             decision=decision,
             calibration_status="CALIBRATED",

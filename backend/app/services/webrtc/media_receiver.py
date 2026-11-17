@@ -150,9 +150,8 @@ class AudioTrackConsumer:
                     self._telemetry.first_sample_timestamp = now
                     self._telemetry.source_sample_rate = frame.sample_rate
                     self._telemetry.source_channels = len(frame.layout.channels) if frame.layout else 1
-                    self._telemetry.negotiated_codec = getattr(
-                        self._track, 'kind', 'audio'
-                    )
+                    # WebRTC audio tracks use Opus (Fix M5). Never report "audio" as codec.
+                    self._telemetry.negotiated_codec = "opus (inferred)"
 
                     logger.info(
                         f"WebRTC audio: first frame received for track {self._track_id} — "

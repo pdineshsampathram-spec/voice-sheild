@@ -9,6 +9,8 @@ from app.schemas.analysis import SystemHealth, ModelStatus
 from app.services.antispoof.spectra_detector import spectra_detector
 from app.services.vad.silero_service import vad_service
 from app.services.speaker.ecapa_service import ecapa_service
+from app.services.antispoof.calibrator import score_calibrator
+import app.api.ws_monitor as ws_monitor
 
 router = APIRouter()
 
@@ -18,6 +20,13 @@ _start_time = time.time()
 @router.get("/health", response_model=SystemHealth)
 async def health_check():
     """System health check including model status."""
+    asr = ws_monitor._shared_asr_provider
+    asr_status = "ONLINE" if (asr and asr.is_loaded()) else "ASR_UNAVAILABLE"
+    asr_msg = (
+        f"model={getattr(asr, '_model_name', 'base')}, backend={getattr(asr, '_backend', 'ctranslate2')}"
+        if asr else "Not loaded"
+    )
+
     models = [
         ModelStatus(
             name="Spectra-AASIST",
@@ -36,6 +45,18 @@ async def health_check():
             status=vad_service.status,
             message=vad_service.status_message,
             load_time_ms=vad_service.load_time_ms,
+        ),
+        ModelStatus(
+            name="Faster-Whisper",
+            status=asr_status,
+            message=asr_msg,
+            load_time_ms=getattr(asr, "_load_time_ms", None) if asr else None,
+        ),
+        ModelStatus(
+            name="Score-Calibrator",
+            status=score_calibrator.status,
+            message=f"version={score_calibrator.version}, domain={score_calibrator.domain}, method={score_calibrator.method}",
+            load_time_ms=None,
         ),
     ]
 

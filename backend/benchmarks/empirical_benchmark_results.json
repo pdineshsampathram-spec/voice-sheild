@@ -1,0 +1,192 @@
+{
+  "timestamp": "2026-09-10T16:21:13.277736+00:00",
+  "model": "Spectra-AASIST",
+  "domain": "webrtc_opus",
+  "proof_linear_correlation_bf_sp": -0.999643763395397,
+  "proof_linear_correlation_bf_delta": -0.9999114598491232,
+  "validation_metrics": {
+    "auc": 1.0,
+    "eer": 0.0,
+    "eer_threshold": 7.5655,
+    "operating_threshold": 7.5655,
+    "fpr": 0.0,
+    "fnr": 0.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "confusion_matrix": {
+      "tn": 27,
+      "fp": 0,
+      "fn": 0,
+      "tp": 30
+    }
+  },
+  "validation_distributions": {
+    "genuine_clean": {
+      "count": 9,
+      "mean_delta": -4.2414,
+      "std_delta": 2.9901,
+      "min_delta": -6.6,
+      "max_delta": 3.847,
+      "mean_rms": 0.02808
+    },
+    "genuine_low_snr": {
+      "count": 9,
+      "mean_delta": -4.0527,
+      "std_delta": 1.4774,
+      "min_delta": -6.1673,
+      "max_delta": -1.7266,
+      "mean_rms": 0.02894
+    },
+    "genuine_opus": {
+      "count": 9,
+      "mean_delta": -4.633,
+      "std_delta": 1.5996,
+      "min_delta": -6.773,
+      "max_delta": -1.8383,
+      "mean_rms": 0.02762
+    },
+    "silence_noise": {
+      "count": 5,
+      "mean_delta": 1.3333,
+      "std_delta": 0.3565,
+      "min_delta": 0.7365,
+      "max_delta": 1.6681,
+      "mean_rms": 0.00136
+    },
+    "tts_synthetic": {
+      "count": 15,
+      "mean_delta": 9.0117,
+      "std_delta": 0.728,
+      "min_delta": 7.5655,
+      "max_delta": 10.0072,
+      "mean_rms": 0.13464
+    },
+    "voice_conversion": {
+      "count": 15,
+      "mean_delta": 8.8931,
+      "std_delta": 0.8237,
+      "min_delta": 7.7723,
+      "max_delta": 10.003,
+      "mean_rms": 0.13464
+    }
+  },
+  "validation_temporal_strategies": {
+    "single_window": {
+      "name": "Instantaneous (1 Window)",
+      "alert_rate": 0.5263,
+      "mean_detection_latency_s": 0.0
+    },
+    "hysteresis_2": {
+      "name": "Hysteresis (2 Consecutive Elevated)",
+      "alert_rate": 0.4737,
+      "mean_detection_latency_s": 2.0
+    },
+    "hysteresis_3": {
+      "name": "Hysteresis (3 Consecutive Elevated)",
+      "alert_rate": 0.4211,
+      "mean_detection_latency_s": 4.0
+    },
+    "ewma_alpha_0_4": {
+      "name": "EWMA Smoothed (alpha=0.4)",
+      "alert_rate": 0.5263,
+      "mean_detection_latency_s": 0.0
+    }
+  },
+  "derived_operating_threshold": 7.565451383590698,
+  "derived_quality_gate_rms": 0.0042,
+  "held_out_test_metrics": {
+    "auc": 1.0,
+    "eer": 0.0,
+    "eer_threshold": 5.3139,
+    "operating_threshold": 7.5655,
+    "fpr": 0.0,
+    "fnr": 0.1818,
+    "precision": 1.0,
+    "recall": 0.8182,
+    "f1": 0.9,
+    "confusion_matrix": {
+      "tn": 30,
+      "fp": 0,
+      "fn": 8,
+      "tp": 36
+    }
+  },
+  "held_out_test_bootstrap_ci": {
+    "auc_ci_95": [
+      1.0,
+      1.0
+    ],
+    "eer_ci_95": [
+      0.0,
+      0.0
+    ],
+    "fpr_ci_95": [
+      0.0,
+      0.0
+    ],
+    "fnr_ci_95": [
+      0.0714,
+      0.2941
+    ]
+  },
+  "held_out_test_by_category": {
+    "genuine_clean": {
+      "count": 10,
+      "mean_delta": -4.8323,
+      "std_delta": 2.1302,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "genuine_low_snr": {
+      "count": 10,
+      "mean_delta": -4.716,
+      "std_delta": 1.7551,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "genuine_opus": {
+      "count": 10,
+      "mean_delta": -5.2753,
+      "std_delta": 1.8306,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "silence_noise": {
+      "count": 5,
+      "mean_delta": 1.2081,
+      "std_delta": 0.3196,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "tts_neural": {
+      "count": 2,
+      "mean_delta": 6.8474,
+      "std_delta": 0.1832,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "tts_opus": {
+      "count": 2,
+      "mean_delta": 6.0438,
+      "std_delta": 0.3388,
+      "flagged_as_spoof": 0,
+      "flag_rate": 0.0
+    },
+    "tts_synthetic": {
+      "count": 20,
+      "mean_delta": 8.8185,
+      "std_delta": 1.1224,
+      "flagged_as_spoof": 18,
+      "flag_rate": 0.9
+    },
+    "voice_conversion": {
+      "count": 20,
+      "mean_delta": 8.5459,
+      "std_delta": 0.6391,
+      "flagged_as_spoof": 18,
+      "flag_rate": 0.9
+    }
+  },
+  "genuine_webrtc_opus_false_spoof_alert_rate": 0.0
+}

@@ -26,7 +26,6 @@ from app.services.monitor.security_pipeline import (
     SecurityPipeline, DetectionEvent, SpeakerEvent, WindowProgress
 )
 from app.services.webrtc.media_receiver import WebRTCMediaReceiver
-from app.services.asr.hf_whisper_provider import HFWhisperProvider
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +75,14 @@ class MonitorSession:
 
         # Infrastructure
         self._audio_bus = AudioBus()
-        self._executor = ThreadPoolExecutor(
-            max_workers=2,  # One for ASR, one for AASIST/ECAPA
-            thread_name_prefix=f"monitor-{self.session_id[:8]}",
+        # Separate executors prevent ASR/AASIST head-of-line blocking (Fix M1)
+        self._asr_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"asr-{self.session_id[:8]}",
+        )
+        self._security_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"sec-{self.session_id[:8]}",
         )
 
         # Pipelines
@@ -150,25 +154,33 @@ class MonitorSession:
         """Initialize and start all pipelines.
 
         Args:
-            asr_provider: Optional pre-loaded ASR provider. If None,
-                          creates and loads FasterWhisperProvider.
+            asr_provider: Pre-loaded ASR provider instance. REQUIRED.
+                          Must be loaded once at application startup and
+                          shared across sessions (Fix C1).
+
+        Raises:
+            ValueError: If no asr_provider is given. Sessions must not
+                        load their own ASR model.
         """
         self._start_time = time.time()
         logger.info(f"MonitorSession {self.session_id}: starting (track={self.track_id}, source={self.track_source})")
-        # Create ASR provider
+
+        # C1 FIX: Use pre-loaded shared ASR provider instance.
+        # Sessions never instantiate their own ASR model.
         if asr_provider is None:
-            asr_provider = HFWhisperProvider(
-                model_name=self._asr_model_size,
-                backend="ctranslate2",
-                beam_size=1,
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
+            from app.api.ws_monitor import _get_or_create_asr
+            asr_provider = _get_or_create_asr(self._asr_model_size)
+
+        if hasattr(asr_provider, 'is_loaded') and not asr_provider.is_loaded():
+            logger.error(
+                f"MonitorSession {self.session_id}: ASR provider is not loaded. "
+                f"Captions will be unavailable (ASR_UNAVAILABLE)."
             )
-            asr_provider.load_model()
 
         logger.info(
             f"[Live ASR Init] MonitorSession {self.session_id}: ASR Provider={type(asr_provider).__name__}, "
-            f"model={getattr(asr_provider, '_model_name', 'base')}, backend={getattr(asr_provider, '_backend', 'ctranslate2')}"
+            f"model={getattr(asr_provider, '_model_name', 'base')}, backend={getattr(asr_provider, '_backend', 'ctranslate2')}, "
+            f"loaded={asr_provider.is_loaded() if hasattr(asr_provider, 'is_loaded') else 'unknown'}"
         )
 
         # Subscribe consumers to audio bus
@@ -184,12 +196,12 @@ class MonitorSession:
             policy=OverflowPolicy.EMIT_DISCONTINUITY,
         )
 
-        # Create pipelines with independent state
+        # Create pipelines with independent state and SEPARATE executors (Fix M1)
         self._caption_pipeline = CaptionPipeline(
             audio_queue=caption_queue,
             asr_provider=asr_provider,
             on_event=self._on_event,
-            executor=self._executor,
+            executor=self._asr_executor,
             session_id=self.session_id,
             track_id=self.track_id,
         )
@@ -197,7 +209,7 @@ class MonitorSession:
         self._security_pipeline = SecurityPipeline(
             audio_queue=security_queue,
             on_event=self._on_event,
-            executor=self._executor,
+            executor=self._security_executor,
             session_id=self.session_id,
             track_id=self.track_id,
         )
@@ -236,7 +248,13 @@ class MonitorSession:
             await self._webrtc_receiver.close()
 
         self._audio_bus.reset()
-        self._executor.shutdown(wait=False)
+        while not self._event_queue.empty():
+            try:
+                self._event_queue.get_nowait()
+            except Exception:
+                break
+        self._asr_executor.shutdown(wait=False)
+        self._security_executor.shutdown(wait=False)
         self._started = False
 
         logger.info(
@@ -257,6 +275,7 @@ class MonitorSession:
         """Get comprehensive session telemetry including actual runtime models."""
         from app.services.antispoof.spectra_detector import spectra_detector
         from app.services.speaker.ecapa_service import ecapa_service
+        from app.services.antispoof.calibrator import score_calibrator
 
         asr_info = {}
         if self._caption_pipeline and hasattr(self._caption_pipeline, "_asr") and self._caption_pipeline._asr:
@@ -312,6 +331,9 @@ class MonitorSession:
                 "ecapa_model": "ECAPA-TDNN",
                 "ecapa_loaded": ecapa_service.is_loaded,
                 "vad_model": "Silero-VAD",
+                "calibration_status": score_calibrator.status,
+                "calibration_version": score_calibrator.version,
+                "calibration_domain": score_calibrator.domain,
             },
             "uptime_s": round(time.time() - self._start_time, 1) if self._started else 0,
             "audio_bus": self._audio_bus.get_telemetry(),
@@ -328,13 +350,19 @@ class MonitorSession:
             "timeline_entries": len(self._timeline),
         }
 
-        if self._webrtc_receiver:
-            # Inject latest VAD into receiver telemetry for fallback parity
-            webrtc_telemetry["vad_probability"] = vad_prob
-            webrtc_telemetry["speech_active"] = vad_speech_active
-            telemetry["webrtc"] = webrtc_telemetry
+        # Live State Machine & Safety Invariant (Part 0, 15)
+        if not self._started:
+            live_state = "STOPPED"
+        elif self._security_pipeline and getattr(self._security_pipeline, "_pipeline_errors", 0) > 0:
+            live_state = "DEGRADED"
+        elif webrtc_telemetry.get("status") == "active" or webrtc_telemetry.get("frames_decoded", 0) > 0:
+            live_state = "MONITORING"
         else:
-            telemetry["webrtc"] = {"status": "unavailable"}
+            live_state = "CONNECTING"
+
+        telemetry["live_state"] = live_state
+        telemetry["call_status"] = "CONTINUOUS"
+        telemetry["enrolled_profiles_count"] = len(ecapa_service.list_profiles()) if ecapa_service.is_loaded else 0
 
         return telemetry
 

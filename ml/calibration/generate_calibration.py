@@ -40,7 +40,7 @@ def generate_calibration(output_path="ml/calibration/calibration_v1.json", bonaf
             "model_name": "AASIST-L",
             "model_revision": "SpeechAntiSpoofingBenchmarks/AASIST-L",
             "evaluation_dataset": "None (Awaiting benchmark execution)",
-            "evaluation_date": datetime.datetime.utcnow().isoformat() + "Z",
+            "evaluation_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "sample_count": 0,
             "operating_point": None,
             "note": "Raw anti-spoof model scores are reported without mapping to probabilistic risk levels until evaluation on target corpus is completed."
@@ -52,7 +52,7 @@ def generate_calibration(output_path="ml/calibration/calibration_v1.json", bonaf
             "model_name": "AASIST-L",
             "model_revision": "SpeechAntiSpoofingBenchmarks/AASIST-L",
             "evaluation_dataset": "ASVspoof2019_LA_eval",
-            "evaluation_date": datetime.datetime.utcnow().isoformat() + "Z",
+            "evaluation_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "sample_count": len(bonafide_scores) + len(spoof_scores),
             "operating_point": {
                 "threshold": round(threshold, 4),

@@ -1,13 +1,12 @@
 """
+[DEPRECATED / LEGACY ASR IMPLEMENTATION] (Fix M4)
+NOTE: This module is NOT used by any production or runtime paths.
+The production runtime exclusively uses HFWhisperProvider (with ctranslate2
+backend) in app.services.asr.hf_whisper_provider.
+This file is retained strictly for backwards compatibility with offline
+benchmarks (run_e2e.py, run_asr.py). Do not import in production paths.
+
 faster-whisper ASR provider implementation.
-
-Uses CTranslate2-optimized Whisper for CPU-friendly transcription.
-Model variant (tiny/base/small) should be selected based on measured
-benchmarks on the user's actual hardware, not assumed.
-
-This provider does NOT do naive fixed-interval chunking.
-It expects pre-segmented speech (from VAD) and transcribes complete
-speech segments.
 """
 
 import logging

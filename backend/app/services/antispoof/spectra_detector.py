@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchaudio
 
 from app.core.config import settings
 from app.schemas.analysis import SpoofResult
@@ -157,8 +158,9 @@ class SpectraAASISTDetector:
             # Forward pass — output shape: (batch, 2)
             # ASVspoof / SpectraAASIST convention:
             # Index 0 = spoof logit, Index 1 = bonafide logit
-            # In SpectraAASIST.classify(): forward(x)[:, 1] > threshold evaluates bonafide.
-            logits = self.model(audio_tensor)
+            # Apply official Spectra-AASIST preemphasis before forward pass
+            audio_pre = torchaudio.functional.preemphasis(audio_tensor)
+            logits = self.model(audio_pre)
 
             # Apply softmax to get normalized probabilities
             probs = F.softmax(logits, dim=1)
@@ -167,9 +169,11 @@ class SpectraAASISTDetector:
             bonafide_score = probs[0, 1].item()
             raw_logit_spoof = logits[0, 0].item()
             raw_logit_bonafide = logits[0, 1].item()
+            delta = raw_logit_spoof - raw_logit_bonafide
 
-        # Determine label
-        label = "spoof" if spoof_score > bonafide_score else "bonafide"
+        # Determine label based on model's trained decision boundary on logit_bonafide
+        # Author implementation: classify() uses forward(x)[:, 1] > threshold
+        label = "bonafide" if raw_logit_bonafide > settings.spectra_classify_threshold else "spoof"
 
         return SpoofResult(
             model="Spectra-AASIST",
@@ -178,6 +182,7 @@ class SpectraAASISTDetector:
             bonafide_score=round(bonafide_score, 4),
             raw_logit_spoof=round(raw_logit_spoof, 4),
             raw_logit_bonafide=round(raw_logit_bonafide, 4),
+            delta=round(delta, 4),
         )
 
     @torch.inference_mode()
@@ -206,21 +211,26 @@ class SpectraAASISTDetector:
 
         with self._lock:
             batch = torch.cat(padded, dim=0).to(self.device)
-            logits = self.model(batch)
+            batch_pre = torchaudio.functional.preemphasis(batch)
+            logits = self.model(batch_pre)
             probs = F.softmax(logits, dim=1)
 
         results = []
         for i in range(len(audio_tensors)):
             spoof_score = probs[i, 0].item()
             bonafide_score = probs[i, 1].item()
-            label = "spoof" if spoof_score > bonafide_score else "bonafide"
+            sp = logits[i, 0].item()
+            bf = logits[i, 1].item()
+            delta = sp - bf
+            label = "bonafide" if bf > settings.spectra_classify_threshold else "spoof"
             results.append(SpoofResult(
                 model="Spectra-AASIST",
                 label=label,
                 spoof_score=round(spoof_score, 4),
                 bonafide_score=round(bonafide_score, 4),
-                raw_logit_spoof=round(logits[i, 0].item(), 4),
-                raw_logit_bonafide=round(logits[i, 1].item(), 4),
+                raw_logit_spoof=round(sp, 4),
+                raw_logit_bonafide=round(bf, 4),
+                delta=round(delta, 4),
             ))
 
         return results

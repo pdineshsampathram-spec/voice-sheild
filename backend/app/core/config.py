@@ -53,8 +53,12 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
-    # Speaker profiles
+    # Speaker profiles & enrollment samples
     speaker_profiles_dir: str = "./speaker_profiles"
+    enrollment_samples_dir: str = "./enrollment_samples"
+
+    # Analyzed recordings cache
+    recordings_cache_dir: str = "./recordings_cache"
 
     # Challenge verification
     challenge_timeout_seconds: int = 30
@@ -137,6 +141,18 @@ class Settings(BaseSettings):
     @property
     def cache_path(self) -> Path:
         path = Path(self.model_cache_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def recordings_path(self) -> Path:
+        path = Path(self.recordings_cache_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def enrollment_samples_path(self) -> Path:
+        path = Path(self.enrollment_samples_dir)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

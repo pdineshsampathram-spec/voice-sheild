@@ -144,11 +144,15 @@ class HFWhisperProvider(ASRProvider):
             raise RuntimeError("Hugging Face ASR provider model is not loaded.")
 
         start_time = time.time()
-        audio_np = audio.cpu().numpy() if isinstance(audio, torch.Tensor) else np.asarray(audio, dtype=np.float32)
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.detach().cpu().numpy().copy()
+        else:
+            audio_np = np.array(audio, dtype=np.float32, copy=True)
 
-        # Ensure 1D float32
+        # Ensure 1D float32 contiguous array
         if audio_np.ndim > 1:
             audio_np = audio_np.squeeze()
+        audio_np = np.ascontiguousarray(audio_np, dtype=np.float32)
 
         text = ""
         detected_language = "en"
@@ -159,13 +163,16 @@ class HFWhisperProvider(ASRProvider):
                 text = outputs.get("text", "").strip()
             elif self._model is not None:
                 # Optimized CTranslate2 Hugging Face Whisper decoding
+                # CRITICAL: temperature=0.0 prevents temperature fallback to random sampling (0.2, 0.4, 0.8, 1.0)
+                # which causes hallucinatory repetition loops on low-confidence or chopped audio.
                 segments, info = self._model.transcribe(
                     audio_np,
                     beam_size=self._beam_size,
                     language="en",
                     vad_filter=False,  # External Silero VAD already segmented the speech
                     word_timestamps=False,
-                    condition_on_previous_text=False,  # Suppress loop hallucinations
+                    condition_on_previous_text=False,  # Suppress loop hallucinations across segments
+                    temperature=0.0,
                     no_speech_threshold=self._no_speech_threshold,
                     log_prob_threshold=self._log_prob_threshold,
                     compression_ratio_threshold=2.4,
@@ -175,18 +182,33 @@ class HFWhisperProvider(ASRProvider):
                 max_no_speech_prob = 0.0
                 segment_count = 0
 
-                FORBIDDEN_HALLUCINATIONS = {
+                UNCONDITIONAL_HALLUCINATIONS = {
                     "i'll see you in the next video",
                     "see you in the next video",
                     "thank you for watching",
                     "thanks for watching",
                     "don't forget to subscribe",
                     "please subscribe",
-                    "amen",
+                    "subscribe to my channel",
+                    "like and subscribe",
                     "subtitles by",
                     "english subtitles",
                     "closed captioning provided by",
                     "transcription by",
+                    "translated by",
+                    "watching",
+                }
+
+                SUSPECT_PHANTOMS = {
+                    "i'm sorry",
+                    "im sorry",
+                    "sorry",
+                    "amen",
+                    "you",
+                    "thank you",
+                    "thanks",
+                    "bye",
+                    "goodbye",
                 }
 
                 for s in segments:
@@ -198,18 +220,24 @@ class HFWhisperProvider(ASRProvider):
                     max_no_speech_prob = max(max_no_speech_prob, s_no_speech)
 
                     # Hallucination filter: high no_speech_prob or poor acoustic likelihood
-                    if s_no_speech > 0.45:
+                    if s_no_speech > 0.40:
                         logger.debug(f"[ASR Defense] Rejected segment '{s_text}': high no_speech_prob={s_no_speech:.3f}")
                         continue
-                    if s_avg_logprob < -1.1:
+                    if s_avg_logprob < -1.0:
                         logger.debug(f"[ASR Defense] Rejected segment '{s_text}': low avg_logprob={s_avg_logprob:.3f}")
                         continue
 
-                    # Filter known training priors (e.g. YouTube outro boilerplate)
+                    # Filter known training priors (e.g. YouTube outro boilerplate) - unconditionally
                     clean_lower = s_text.lower().strip(" .!?,;:")
-                    if clean_lower in FORBIDDEN_HALLUCINATIONS and (s_avg_logprob < -0.4 or s_no_speech > 0.2):
-                        logger.info(f"[ASR Defense] Filtered YouTube/training prior hallucination: '{s_text}'")
+                    if clean_lower in UNCONDITIONAL_HALLUCINATIONS or clean_lower.endswith("in the next video") or clean_lower.endswith("for watching"):
+                        logger.info(f"[ASR Defense] Filtered training prior hallucination: '{s_text}'")
                         continue
+
+                    # Filter phantom short hallucinations on low-confidence or short audio
+                    if clean_lower in SUSPECT_PHANTOMS:
+                        if s_no_speech > 0.15 or s_avg_logprob < -0.45 or len(audio_np) < 16000 * 0.75:
+                            logger.info(f"[ASR Defense] Filtered phantom short hallucination '{s_text}' (no_speech={s_no_speech:.3f}, logprob={s_avg_logprob:.3f})")
+                            continue
 
                     if s_text:
                         valid_parts.append(s_text)

@@ -9,7 +9,7 @@ import json
 import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -36,7 +36,7 @@ class LiveSession:
         self.websocket = websocket
         self.speaker_id = speaker_id
         self.risk_engine = RiskEngine()
-        self.started_at = datetime.utcnow()
+        self.started_at = datetime.now(timezone.utc)
         self.window_count = 0
         self.is_active = True
         self._pending_results = asyncio.Queue()
