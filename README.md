@@ -18,7 +18,7 @@
 
 ## 🚀 Live Demos & Downloads
 
-- 🌐 **Live WebRTC Web App (Vercel)**: [https://voice-shield-sepia.vercel.app](https://voice-shield-sepia.vercel.app) *(or updated link below)*
+- 🌐 **Live WebRTC Web App (Vercel)**: [https://voice-shield-pdineshsampathram-specs-projects.vercel.app](https://voice-shield-pdineshsampathram-specs-projects.vercel.app)
 - 📦 **Android App Release APK**: [Download VoiceShield Release APK (v1.0.0)](https://github.com/pdineshsampathram-spec/voice-sheild/releases/download/v1.0.0-prototype/app-release.apk)
 - 🧪 **Android App Debug APK**: [Download VoiceShield Debug APK (v1.0.0)](https://github.com/pdineshsampathram-spec/voice-sheild/releases/download/v1.0.0-prototype/app-debug.apk)
 - 🏷️ **GitHub Release Page**: [VoiceShield v1.0.0 Releases](https://github.com/pdineshsampathram-spec/voice-sheild/releases/tag/v1.0.0-prototype)
