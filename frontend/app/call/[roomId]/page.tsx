@@ -4,8 +4,20 @@ import { use, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000";
+const getApiUrl = () => {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window !== "undefined") return "";
+  return "http://localhost:8000";
+};
+
+const getWsUrl = () => {
+  if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
+  if (typeof window !== "undefined") {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}`;
+  }
+  return "ws://localhost:8000";
+};
 
 interface CaptionItem {
   text: string;
@@ -194,7 +206,8 @@ export default function CallRoomPage({
       monitorPcRef.current = null;
     }
     if (monitorSessionIdRef.current) {
-      fetch(`${API_URL}/api/monitor/session/${monitorSessionIdRef.current}`, { method: "DELETE" }).catch(() => {});
+      const apiBase = getApiUrl();
+      fetch(`${apiBase}/api/monitor/session/${monitorSessionIdRef.current}`, { method: "DELETE" }).catch(() => {});
       monitorSessionIdRef.current = null;
     }
     setMonitorConnected(false);
@@ -228,8 +241,9 @@ export default function CallRoomPage({
     }
 
     try {
+      const apiBase = getApiUrl();
       // 1. Create monitor session with explicit track metadata & origin proof
-      const sessionRes = await fetch(`${API_URL}/api/monitor/session`, {
+      const sessionRes = await fetch(`${apiBase}/api/monitor/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -270,7 +284,7 @@ export default function CallRoomPage({
       });
 
       // 3. Send offer to monitor backend
-      const offerRes = await fetch(`${API_URL}/api/monitor/offer`, {
+      const offerRes = await fetch(`${apiBase}/api/monitor/offer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -284,7 +298,8 @@ export default function CallRoomPage({
       await monitorPc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: answerSdp }));
 
       // 4. Open monitor event WebSocket
-      const ws = new WebSocket(`${WS_URL}/api/monitor/ws/${session_id}`);
+      const wsUrl = getWsUrl();
+      const ws = new WebSocket(`${wsUrl}/api/monitor/ws/${session_id}`);
       ws.onopen = () => setMonitorConnected(true);
       ws.onclose = () => setMonitorConnected(false);
       ws.onerror = () => setMonitorError("Observer WebSocket disconnected (Two-Way Call Continues)");
@@ -384,23 +399,39 @@ export default function CallRoomPage({
   }, [monitorActive, monitorTarget, remoteTrackAvailable, startObserver, stopObserver]);
 
   // ────────────────────────────────────────────────────────────
-  // 3. Two-Way P2P WebRTC State Machine with Perfect Negotiation
+  // 3. Two-Way P2P WebRTC State Machine with Perfect Negotiation & Dual Signaling
   // ────────────────────────────────────────────────────────────
   useEffect(() => {
     let isCancelled = false;
     let signalingWs: WebSocket | null = null;
     let p2pPc: RTCPeerConnection | null = null;
+    let pollInterval: any = null;
+    let lastSeenSeq = 0;
+    let isWsConnected = false;
     const queue = new SignalingQueue();
 
     const sendSignal = (type: string, payload: any) => {
+      const msg = {
+        type,
+        sender_id: peerIdRef.current,
+        generation: connectionGenerationRef.current,
+        payload,
+        timestamp: Date.now() / 1000,
+      };
+
       if (signalingWs && signalingWs.readyState === WebSocket.OPEN) {
-        signalingWs.send(JSON.stringify({
-          type,
-          sender_id: peerIdRef.current,
-          generation: connectionGenerationRef.current,
-          payload,
-          timestamp: Date.now() / 1000,
-        }));
+        signalingWs.send(JSON.stringify(msg));
+      } else {
+        fetch("/api/rtc/signal", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "send",
+            room_id: roomId,
+            peer_id: peerIdRef.current,
+            message: msg,
+          }),
+        }).catch(() => {});
       }
     };
 
@@ -493,18 +524,8 @@ export default function CallRoomPage({
           });
         };
 
-        // 3. Setup WebSocket Signaling with peer_id query param
-        signalingWs = new WebSocket(`${WS_URL}/api/rtc/ws/${roomId}?peer_id=${peerIdRef.current}`);
-        signalingWsRef.current = signalingWs;
-
-        signalingWs.onopen = () => {
-          console.log("[Signaling] WebSocket connected to room", roomId, "as", peerIdRef.current);
-          setCallState("waiting");
-        };
-
-        signalingWs.onmessage = async (msgEvent) => {
+        const handleSignalData = async (data: any) => {
           try {
-            const data = JSON.parse(msgEvent.data);
             const { type, payload, is_polite, generation, peer_count } = data;
 
             if (generation && generation < connectionGenerationRef.current) {
@@ -519,7 +540,6 @@ export default function CallRoomPage({
               peerCountRef.current = count;
               setPeerCount(count);
               console.log(`[Signaling] Joined room. Role: ${isPoliteRef.current ? "polite" : "impolite"}, Gen: ${generation}, Peers: ${count}`);
-              // If joined room where peer already exists and we are impolite, initiate offer
               if (count >= 2 && !isPoliteRef.current) {
                 await queue.enqueue(async () => {
                   if (!p2pPc || isCancelled) return;
@@ -539,7 +559,6 @@ export default function CallRoomPage({
               peerCountRef.current = count;
               setPeerCount(count);
               console.log("[Signaling] Remote peer joined room. Peers:", count);
-              // Impolite peer initiates offer upon remote peer arrival
               if (!isPoliteRef.current) {
                 await queue.enqueue(async () => {
                   if (!p2pPc || isCancelled) return;
@@ -607,6 +626,94 @@ export default function CallRoomPage({
           }
         };
 
+        const startHttpSignaling = async () => {
+          if (isCancelled || isWsConnected) return;
+          console.log("[Signaling] Using HTTP polling signaling for room", roomId);
+          setCallState("waiting");
+
+          try {
+            const joinRes = await fetch("/api/rtc/signal", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "join", room_id: roomId, peer_id: peerIdRef.current }),
+            });
+            if (joinRes.ok) {
+              const joinData = await joinRes.json();
+              lastSeenSeq = joinData.current_seq || 0;
+              await handleSignalData(joinData);
+            }
+          } catch (e) {
+            console.warn("HTTP join error", e);
+          }
+
+          if (pollInterval) clearInterval(pollInterval);
+          pollInterval = setInterval(async () => {
+            if (isCancelled || isWsConnected) return;
+            try {
+              const pollRes = await fetch("/api/rtc/signal", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ action: "poll", room_id: roomId, peer_id: peerIdRef.current, last_seq: lastSeenSeq }),
+              });
+              if (pollRes.ok) {
+                const pollData = await pollRes.json();
+                if (typeof pollData.current_seq === "number") {
+                  lastSeenSeq = pollData.current_seq;
+                }
+                if (typeof pollData.peer_count === "number" && pollData.peer_count !== peerCountRef.current) {
+                  peerCountRef.current = pollData.peer_count;
+                  setPeerCount(pollData.peer_count);
+                }
+                if (Array.isArray(pollData.messages)) {
+                  for (const m of pollData.messages) {
+                    await handleSignalData(m);
+                  }
+                }
+              }
+            } catch {
+              // Ignore polling hiccups
+            }
+          }, 700);
+        };
+
+        // 3. Setup WebSocket Signaling with peer_id query param
+        try {
+          const wsUrl = getWsUrl();
+          signalingWs = new WebSocket(`${wsUrl}/api/rtc/ws/${roomId}?peer_id=${peerIdRef.current}`);
+          signalingWsRef.current = signalingWs;
+
+          signalingWs.onopen = () => {
+            console.log("[Signaling] WebSocket connected to room", roomId, "as", peerIdRef.current);
+            isWsConnected = true;
+            if (pollInterval) clearInterval(pollInterval);
+            setCallState("waiting");
+          };
+
+          signalingWs.onmessage = async (msgEvent) => {
+            try {
+              const data = JSON.parse(msgEvent.data);
+              await handleSignalData(data);
+            } catch (err) {
+              console.error("[Signaling] WS parse error:", err);
+            }
+          };
+
+          signalingWs.onerror = () => {
+            if (!isWsConnected) {
+              startHttpSignaling();
+            }
+          };
+
+          // Fallback to HTTP if WS doesn't open within 1.2s
+          setTimeout(() => {
+            if (!isWsConnected) {
+              startHttpSignaling();
+            }
+          }, 1200);
+        } catch {
+          startHttpSignaling();
+        }
+
       } catch (err) {
         if (!isCancelled) {
           console.error("Init P2P call failed:", err);
@@ -619,6 +726,16 @@ export default function CallRoomPage({
 
     return () => {
       isCancelled = true;
+      if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+      fetch("/api/rtc/signal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "leave", room_id: roomId, peer_id: peerIdRef.current }),
+        keepalive: true,
+      }).catch(() => {});
       if (signalingWsRef.current) {
         signalingWsRef.current.close();
         signalingWsRef.current = null;
