@@ -133,17 +133,21 @@ export default function CallRoomPage({
 
   // P2P WebRTC Call State
   const [callState, setCallState] = useState<"connecting" | "waiting" | "connected" | "ended">("connecting");
+  const callStateRef = useRef<"connecting" | "waiting" | "connected" | "ended">("connecting");
   const [peerCount, setPeerCount] = useState(1);
   const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
   const [remoteTrackAvailable, setRemoteTrackAvailable] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef(false);
   const [isDeafened, setIsDeafened] = useState(false);
+  const isDeafenedRef = useRef(false);
   const [remoteVolume, setRemoteVolume] = useState(1.0);
+  const remoteVolumeRef = useRef(1.0);
   const [callDuration, setCallDuration] = useState(0);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
 
-  // Live Audio Meters (Discord-style Voice Activity Detection)
+  // Live Audio Meters (Smooth Discord-style Voice Activity Detection)
   const [isLocalSpeaking, setIsLocalSpeaking] = useState(false);
   const [isRemoteSpeaking, setIsRemoteSpeaking] = useState(false);
   const [localAudioLevel, setLocalAudioLevel] = useState(0); // 0 to 100
@@ -166,7 +170,6 @@ export default function CallRoomPage({
   const [captions, setCaptions] = useState<CaptionItem[]>([]);
   const [detections, setDetections] = useState<DetectionItem[]>([]);
   const [speakerInfo, setSpeakerInfo] = useState<SpeakerItem | null>(null);
-  const [windowProgress, setWindowProgress] = useState<number>(0);
 
   // WebRTC & Audio Processing Refs
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -176,6 +179,8 @@ export default function CallRoomPage({
   const p2pPcRef = useRef<RTCPeerConnection | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const remoteGainNodeRef = useRef<GainNode | null>(null);
+  const localSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const remoteSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
   // Signaling & State Refs
@@ -184,6 +189,8 @@ export default function CallRoomPage({
   const makingOfferRef = useRef<boolean>(false);
   const ignoreOfferRef = useRef<boolean>(false);
   const remoteDescriptionSetRef = useRef<boolean>(false);
+  const hasNegotiatedRef = useRef<boolean>(false);
+  const connectedRef = useRef<boolean>(false);
   const iceCandidateQueueRef = useRef<RTCIceCandidateInit[]>([]);
   const signalingWsRef = useRef<WebSocket | null>(null);
   const ntfyWsRef = useRef<WebSocket | null>(null);
@@ -195,6 +202,23 @@ export default function CallRoomPage({
   const monitorSessionIdRef = useRef<string | null>(null);
   const lastEventSeqRef = useRef<number>(-1);
   const latestFinalUtteranceRef = useRef<number>(0);
+
+  // Keep state refs in sync
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  useEffect(() => {
+    isDeafenedRef.current = isDeafened;
+  }, [isDeafened]);
+
+  useEffect(() => {
+    remoteVolumeRef.current = remoteVolume;
+  }, [remoteVolume]);
 
   // ────────────────────────────────────────────────────────────
   // 1. Backend Probe Check on Page Mount
@@ -210,14 +234,12 @@ export default function CallRoomPage({
           const data = await res.json();
           if (data.available) {
             setIsBackendAvailable(true);
-            // If backend is active, user can start in shield or discord
             return;
           }
         }
       } catch {
         // Fallback
       }
-      // Backend validation not found or not deployed
       setIsBackendAvailable(false);
       setShowNoShieldModal(true);
       setUiMode("discord");
@@ -241,7 +263,7 @@ export default function CallRoomPage({
   };
 
   // ────────────────────────────────────────────────────────────
-  // 3. Web Audio Setup & Live Volume Monitoring
+  // 3. Web Audio Setup & Smooth Live Volume Monitoring
   // ────────────────────────────────────────────────────────────
   const getOrCreateAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
@@ -254,69 +276,125 @@ export default function CallRoomPage({
     return audioContextRef.current;
   }, []);
 
-  const setupAudioProcessing = useCallback((localStream: MediaStream, remoteStream?: MediaStream) => {
+  const attachLocalStreamToWebAudio = useCallback((localStream: MediaStream) => {
     try {
       const audioCtx = getOrCreateAudioContext();
-
-      // Local microphone analyzer
-      const localSource = audioCtx.createMediaStreamSource(localStream);
-      const localAnalyser = audioCtx.createAnalyser();
-      localAnalyser.fftSize = 256;
-      localSource.connect(localAnalyser);
-
-      // Remote incoming audio analyzer + gain routing
-      let remoteAnalyser: AnalyserNode | null = null;
-      if (remoteStream) {
-        const remoteSource = audioCtx.createMediaStreamSource(remoteStream);
-        remoteAnalyser = audioCtx.createAnalyser();
-        remoteAnalyser.fftSize = 256;
-
-        const gainNode = audioCtx.createGain();
-        gainNode.gain.value = isDeafened ? 0 : remoteVolume;
-        remoteGainNodeRef.current = gainNode;
-
-        remoteSource.connect(remoteAnalyser);
-        remoteAnalyser.connect(gainNode);
-        gainNode.connect(audioCtx.destination);
+      if (localSourceRef.current) {
+        try { localSourceRef.current.disconnect(); } catch {}
       }
 
+      const localSource = audioCtx.createMediaStreamSource(localStream);
+      localSourceRef.current = localSource;
+      const localAnalyser = audioCtx.createAnalyser();
+      localAnalyser.fftSize = 128;
+      localSource.connect(localAnalyser);
+
       const localDataArray = new Uint8Array(localAnalyser.frequencyBinCount);
-      const remoteDataArray = remoteAnalyser ? new Uint8Array(remoteAnalyser.frequencyBinCount) : null;
+      let localHangoverTimer: any = null;
+      let lastUiUpdate = 0;
 
-      const updateVolumeLoop = () => {
-        // Measure local volume
+      const loop = () => {
         localAnalyser.getByteFrequencyData(localDataArray);
-        let localSum = 0;
-        for (let i = 0; i < localDataArray.length; i++) {
-          localSum += localDataArray[i];
-        }
-        const localAvg = localSum / localDataArray.length;
-        const localPct = Math.min(100, Math.round((localAvg / 128) * 100));
-        setLocalAudioLevel(localPct);
-        setIsLocalSpeaking(localPct > 12 && !isMuted);
+        let sum = 0;
+        for (let i = 0; i < localDataArray.length; i++) sum += localDataArray[i];
+        const avg = sum / localDataArray.length;
+        const pct = Math.min(100, Math.round((avg / 128) * 100));
 
-        // Measure remote volume
-        if (remoteAnalyser && remoteDataArray) {
-          remoteAnalyser.getByteFrequencyData(remoteDataArray);
-          let remoteSum = 0;
-          for (let i = 0; i < remoteDataArray.length; i++) {
-            remoteSum += remoteDataArray[i];
+        // Smooth VAD with natural 280ms speech hangover
+        const active = pct > 10 && !isMutedRef.current;
+        if (active) {
+          if (localHangoverTimer) {
+            clearTimeout(localHangoverTimer);
+            localHangoverTimer = null;
           }
-          const remoteAvg = remoteSum / remoteDataArray.length;
-          const remotePct = Math.min(100, Math.round((remoteAvg / 128) * 100));
-          setRemoteAudioLevel(remotePct);
-          setIsRemoteSpeaking(remotePct > 12);
+          setIsLocalSpeaking(true);
+        } else {
+          if (!localHangoverTimer) {
+            localHangoverTimer = setTimeout(() => {
+              setIsLocalSpeaking(false);
+              localHangoverTimer = null;
+            }, 280);
+          }
         }
 
-        animationFrameRef.current = requestAnimationFrame(updateVolumeLoop);
+        // Throttle React state update to ~15 FPS to prevent React thread contention
+        const now = performance.now();
+        if (now - lastUiUpdate > 66) {
+          lastUiUpdate = now;
+          setLocalAudioLevel(active ? pct : 0);
+        }
+
+        animationFrameRef.current = requestAnimationFrame(loop);
       };
 
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = requestAnimationFrame(updateVolumeLoop);
+      animationFrameRef.current = requestAnimationFrame(loop);
     } catch (e) {
-      console.warn("[WebAudio] Setup warning:", e);
+      console.warn("[WebAudio] Local audio setup:", e);
     }
-  }, [getOrCreateAudioContext, isDeafened, isMuted, remoteVolume]);
+  }, [getOrCreateAudioContext]);
+
+  const attachRemoteStreamToWebAudio = useCallback((remoteStream: MediaStream) => {
+    try {
+      const audioCtx = getOrCreateAudioContext();
+      if (remoteSourceRef.current) {
+        try { remoteSourceRef.current.disconnect(); } catch {}
+      }
+
+      const remoteSource = audioCtx.createMediaStreamSource(remoteStream);
+      remoteSourceRef.current = remoteSource;
+      const remoteAnalyser = audioCtx.createAnalyser();
+      remoteAnalyser.fftSize = 128;
+
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.setValueAtTime(isDeafenedRef.current ? 0 : remoteVolumeRef.current, audioCtx.currentTime);
+      remoteGainNodeRef.current = gainNode;
+
+      remoteSource.connect(remoteAnalyser);
+      remoteAnalyser.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+
+      const remoteDataArray = new Uint8Array(remoteAnalyser.frequencyBinCount);
+      let remoteHangoverTimer: any = null;
+      let lastRemoteUiUpdate = 0;
+
+      const remoteLoop = () => {
+        remoteAnalyser.getByteFrequencyData(remoteDataArray);
+        let sum = 0;
+        for (let i = 0; i < remoteDataArray.length; i++) sum += remoteDataArray[i];
+        const avg = sum / remoteDataArray.length;
+        const pct = Math.min(100, Math.round((avg / 128) * 100));
+
+        // Smooth VAD with 280ms hangover
+        const active = pct > 10;
+        if (active) {
+          if (remoteHangoverTimer) {
+            clearTimeout(remoteHangoverTimer);
+            remoteHangoverTimer = null;
+          }
+          setIsRemoteSpeaking(true);
+        } else {
+          if (!remoteHangoverTimer) {
+            remoteHangoverTimer = setTimeout(() => {
+              setIsRemoteSpeaking(false);
+              remoteHangoverTimer = null;
+            }, 280);
+          }
+        }
+
+        const now = performance.now();
+        if (now - lastRemoteUiUpdate > 66) {
+          lastRemoteUiUpdate = now;
+          setRemoteAudioLevel(active ? pct : 0);
+        }
+
+        requestAnimationFrame(remoteLoop);
+      };
+      requestAnimationFrame(remoteLoop);
+    } catch (e) {
+      console.warn("[WebAudio] Remote audio setup:", e);
+    }
+  }, [getOrCreateAudioContext]);
 
   // Audio Test Chime for speakers
   const playTestChime = () => {
@@ -339,18 +417,18 @@ export default function CallRoomPage({
   };
 
   // ────────────────────────────────────────────────────────────
-  // 4. Two-Way P2P WebRTC Core Engine with Guaranteed Audio
+  // 4. Stable Two-Way WebRTC Audio Engine (No Disconnection Loops)
   // ────────────────────────────────────────────────────────────
   useEffect(() => {
     let isCancelled = false;
     const queue = new SignalingQueue();
     let pollInterval: any = null;
-    let heartbeatInterval: any = null;
+    let presenceInterval: any = null;
     let lastSeenSeq = 0;
 
     const sanitizedTopic = `voiceshield_rtc_${roomId.toLowerCase().replace(/[^a-z0-9]/g, "_")}`;
 
-    // Universal Signal Sender (ntfy.sh + /api/rtc/signal fallback)
+    // Signal Sender
     const sendSignal = async (type: string, payload: any) => {
       const msgId = `${peerIdRef.current}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       processedMsgIdsRef.current.add(msgId);
@@ -363,7 +441,7 @@ export default function CallRoomPage({
         timestamp: Date.now() / 1000,
       };
 
-      // 1. Broadcast via public high-speed pub/sub broker
+      // 1. Broadcast via public high-speed pub/sub
       fetch(`https://ntfy.sh/${sanitizedTopic}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -391,38 +469,38 @@ export default function CallRoomPage({
           try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
           } catch (err) {
-            console.warn("[P2P WebRTC] Queued ICE candidate add error:", err);
+            console.warn("[P2P WebRTC] Queued candidate add error:", err);
           }
         }
       }
     }
 
     async function handleIncomingSignal(data: any, pc: RTCPeerConnection) {
-      if (isCancelled) return;
+      if (isCancelled || !pc) return;
       try {
         const { msg_id, type, sender_id, payload } = data;
 
         // Skip our own messages
         if (sender_id === peerIdRef.current) return;
 
-        // Deduplicate messages received across both signaling pathways
+        // Deduplicate
         if (msg_id && processedMsgIdsRef.current.has(msg_id)) return;
         if (msg_id) processedMsgIdsRef.current.add(msg_id);
 
         if (sender_id) {
           setRemotePeerId(sender_id);
           setPeerCount(2);
-          // W3C Polite Peer rule: deterministic tie-breaker
+          // W3C Polite Peer rule
           isPoliteRef.current = peerIdRef.current > sender_id;
         }
 
         if (type === "join") {
-          console.log("[P2P WebRTC] Peer joined room:", sender_id);
-          sendSignal("peer_online", { peer_id: peerIdRef.current });
-          setCallState("waiting");
+          console.log("[P2P WebRTC] Remote peer announced presence:", sender_id);
+          sendSignal("ack", { peer_id: peerIdRef.current });
 
-          // Impolite peer initiates offer
-          if (!isPoliteRef.current && pc.signalingState === "stable") {
+          // CRITICAL: Only create offer ONCE. Never recreate or renegotiate if already negotiated!
+          if (!hasNegotiatedRef.current && !isPoliteRef.current && pc.signalingState === "stable") {
+            hasNegotiatedRef.current = true;
             await queue.enqueue(async () => {
               if (isCancelled || !pc) return;
               try {
@@ -432,14 +510,16 @@ export default function CallRoomPage({
                 sendSignal("offer", pc.localDescription);
               } catch (err) {
                 console.error("[P2P WebRTC] Error creating offer on join:", err);
+                hasNegotiatedRef.current = false;
               } finally {
                 makingOfferRef.current = false;
               }
             });
           }
-        } else if (type === "peer_online") {
-          console.log("[P2P WebRTC] Peer confirmed online:", sender_id);
-          if (!isPoliteRef.current && pc.signalingState === "stable") {
+        } else if (type === "ack") {
+          console.log("[P2P WebRTC] Remote peer acknowledged presence:", sender_id);
+          if (!hasNegotiatedRef.current && !isPoliteRef.current && pc.signalingState === "stable") {
+            hasNegotiatedRef.current = true;
             await queue.enqueue(async () => {
               if (isCancelled || !pc) return;
               try {
@@ -448,25 +528,32 @@ export default function CallRoomPage({
                 await pc.setLocalDescription(offer);
                 sendSignal("offer", pc.localDescription);
               } catch (err) {
-                console.error("[P2P WebRTC] Error creating offer on peer_online:", err);
+                console.error("[P2P WebRTC] Error creating offer on ack:", err);
+                hasNegotiatedRef.current = false;
               } finally {
                 makingOfferRef.current = false;
               }
             });
           }
         } else if (type === "offer" && payload) {
+          // If already connected and stable with valid remote track, ignore redundant duplicate offers
+          if (connectedRef.current && pc.signalingState === "stable" && remoteTrackRef.current) {
+            console.log("[P2P WebRTC] Ignoring redundant offer while already connected.");
+            return;
+          }
+
           await queue.enqueue(async () => {
             if (isCancelled || !pc) return;
             const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
             ignoreOfferRef.current = !isPoliteRef.current && offerCollision;
 
             if (ignoreOfferRef.current) {
-              console.warn("[P2P WebRTC] Glare collision on impolite peer: ignoring remote offer");
+              console.warn("[P2P WebRTC] Collision on impolite peer: ignoring remote offer");
               return;
             }
 
             if (offerCollision) {
-              console.info("[P2P WebRTC] Glare collision on polite peer: rolling back local description");
+              console.info("[P2P WebRTC] Collision on polite peer: rolling back local description");
               await pc.setLocalDescription({ type: "rollback" });
             }
 
@@ -476,6 +563,7 @@ export default function CallRoomPage({
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             sendSignal("answer", pc.localDescription);
+            hasNegotiatedRef.current = true;
           });
         } else if (type === "answer" && payload) {
           await queue.enqueue(async () => {
@@ -483,6 +571,7 @@ export default function CallRoomPage({
             if (pc.signalingState === "have-local-offer" || pc.signalingState === "have-remote-pranswer") {
               await pc.setRemoteDescription(new RTCSessionDescription(payload));
               await drainIceCandidateQueue(pc);
+              hasNegotiatedRef.current = true;
             }
           });
         } else if (type === "candidate" && payload) {
@@ -493,7 +582,7 @@ export default function CallRoomPage({
                 await pc.addIceCandidate(new RTCIceCandidate(payload));
               } catch (err) {
                 if (!ignoreOfferRef.current) {
-                  console.warn("[P2P WebRTC] addIceCandidate error:", err);
+                  console.warn("[P2P WebRTC] addIceCandidate warning:", err);
                 }
               }
             } else {
@@ -501,7 +590,9 @@ export default function CallRoomPage({
             }
           });
         } else if (type === "bye") {
-          console.log("[P2P WebRTC] Peer left call");
+          console.log("[P2P WebRTC] Peer left room:", sender_id);
+          connectedRef.current = false;
+          hasNegotiatedRef.current = false;
           setPeerCount(1);
           setRemotePeerId(null);
           setCallState("waiting");
@@ -513,9 +604,9 @@ export default function CallRoomPage({
       }
     }
 
-    async function initCall() {
+    async function initP2PCall() {
       try {
-        // 1. Acquire Local Microphone
+        // 1. Acquire Microphone Stream ONCE
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             channelCount: 1,
@@ -533,7 +624,7 @@ export default function CallRoomPage({
         }
 
         localStreamRef.current = stream;
-        setupAudioProcessing(stream);
+        attachLocalStreamToWebAudio(stream);
 
         // 2. Setup RTCPeerConnection with STUN
         const pc = new RTCPeerConnection({
@@ -549,65 +640,69 @@ export default function CallRoomPage({
 
         // Add local mic track
         stream.getAudioTracks().forEach((track) => {
-          track.enabled = true;
+          track.enabled = !isMutedRef.current;
           pc.addTrack(track, stream);
         });
 
-        // Send ICE candidates
+        // ICE candidate trickling
         pc.onicecandidate = (event) => {
           if (event.candidate) {
             sendSignal("candidate", event.candidate);
           }
         };
 
-        // Remote track received
+        // Incoming audio track from peer
         pc.ontrack = (event) => {
           console.log("[P2P WebRTC] Remote audio track received:", event.track.id);
           remoteTrackRef.current = event.track;
           const remoteStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
           remoteStreamRef.current = remoteStream;
 
-          // Connect to HTML audio tag
+          // Connect HTML audio tag
           if (remoteAudioRef.current) {
             remoteAudioRef.current.srcObject = remoteStream;
-            remoteAudioRef.current.muted = false;
-            remoteAudioRef.current.volume = 1.0;
+            remoteAudioRef.current.muted = isDeafenedRef.current;
+            remoteAudioRef.current.volume = remoteVolumeRef.current;
             const playPromise = remoteAudioRef.current.play();
             if (playPromise !== undefined) {
               playPromise.catch((err) => {
-                console.warn("[P2P WebRTC] Autoplay pending user interaction:", err);
+                console.warn("[P2P WebRTC] Autoplay pending interaction:", err);
                 setAutoplayBlocked(true);
               });
             }
           }
 
-          // Connect to Web Audio Analyser and destination
-          setupAudioProcessing(stream, remoteStream);
+          // Connect to Web Audio Analyser & Speakers
+          attachRemoteStreamToWebAudio(remoteStream);
           setRemoteTrackAvailable(true);
           setCallState("connected");
+          connectedRef.current = true;
         };
 
-        const handleConnChange = () => {
+        const handleConnStateChange = () => {
           const conn = pc.connectionState;
           const ice = pc.iceConnectionState;
-          console.log(`[P2P WebRTC] State changed: conn=${conn}, ice=${ice}`);
+          console.log(`[P2P WebRTC] Connection state: conn=${conn}, ice=${ice}`);
           if (conn === "connected" || ice === "connected" || ice === "completed") {
             setCallState("connected");
+            connectedRef.current = true;
           } else if (conn === "failed" || ice === "failed") {
-            setCallState("waiting");
+            // Attempt clean ICE restart rather than tearing down call
+            try {
+              pc.restartIce();
+            } catch {}
           }
         };
-        pc.onconnectionstatechange = handleConnChange;
-        pc.oniceconnectionstatechange = handleConnChange;
+        pc.onconnectionstatechange = handleConnStateChange;
+        pc.oniceconnectionstatechange = handleConnStateChange;
 
-        // 3. Connect to High-Speed ntfy.sh Pub/Sub WebSocket
+        // 3. Connect to Pub/Sub Signaling WebSocket
         try {
           const ntfyWs = new WebSocket(`wss://ntfy.sh/${sanitizedTopic}/ws`);
           ntfyWsRef.current = ntfyWs;
 
           ntfyWs.onopen = () => {
-            console.log("[Signaling] ntfy.sh WebSocket opened for room", roomId);
-            // Broadcast join
+            console.log("[Signaling] Connected to room signaling as", peerIdRef.current);
             sendSignal("join", { peer_id: peerIdRef.current });
           };
 
@@ -619,18 +714,14 @@ export default function CallRoomPage({
                 await handleIncomingSignal(payload, pc);
               }
             } catch {
-              // Ignore ping/keepalive parse errors
+              // Ignore ping frames
             }
           };
-
-          ntfyWs.onerror = () => {
-            console.warn("[Signaling] ntfy.sh WebSocket error; relying on HTTP fallback");
-          };
         } catch (e) {
-          console.warn("[Signaling] ntfy.sh init error:", e);
+          console.warn("[Signaling] WS connection error:", e);
         }
 
-        // 4. Secondary HTTP Polling Fallback (ensures reliability)
+        // 4. Secondary HTTP Polling Fallback
         pollInterval = setInterval(async () => {
           if (isCancelled) return;
           try {
@@ -656,15 +747,18 @@ export default function CallRoomPage({
               }
             }
           } catch {
-            // Polling hiccup
+            // Ignore polling hiccups
           }
-        }, 800);
+        }, 900);
 
-        // 5. Periodic Heartbeat / Room Ping until connected
-        heartbeatInterval = setInterval(() => {
-          if (isCancelled || callState === "connected") return;
-          sendSignal("ping", { peer_id: peerIdRef.current });
-        }, 2500);
+        // 5. Lightweight Presence Announce (STOPS when connected)
+        presenceInterval = setInterval(() => {
+          if (isCancelled || connectedRef.current) {
+            if (presenceInterval) clearInterval(presenceInterval);
+            return;
+          }
+          sendSignal("join", { peer_id: peerIdRef.current });
+        }, 3000);
 
         // Initial announce
         sendSignal("join", { peer_id: peerIdRef.current });
@@ -676,12 +770,14 @@ export default function CallRoomPage({
       }
     }
 
-    initCall();
+    initP2PCall();
 
     return () => {
       isCancelled = true;
+      connectedRef.current = false;
+      hasNegotiatedRef.current = false;
       if (pollInterval) clearInterval(pollInterval);
-      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      if (presenceInterval) clearInterval(presenceInterval);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
 
       sendSignal("bye", { peer_id: peerIdRef.current });
@@ -707,10 +803,85 @@ export default function CallRoomPage({
         audioContextRef.current = null;
       }
     };
-  }, [roomId, setupAudioProcessing]);
+  }, [roomId, attachLocalStreamToWebAudio, attachRemoteStreamToWebAudio]);
 
   // ────────────────────────────────────────────────────────────
-  // 5. Observer Monitor Tap (Shield View Only)
+  // 5. User Call Controls (Mute, Deafen, Volume, Hangup)
+  // ────────────────────────────────────────────────────────────
+  const toggleMute = () => {
+    setIsMuted((prev) => {
+      const nextMuted = !prev;
+      if (localStreamRef.current) {
+        localStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = !nextMuted;
+        });
+      }
+      return nextMuted;
+    });
+  };
+
+  const toggleDeafen = () => {
+    setIsDeafened((prev) => {
+      const nextDeaf = !prev;
+      if (remoteGainNodeRef.current && audioContextRef.current) {
+        remoteGainNodeRef.current.gain.setValueAtTime(
+          nextDeaf ? 0 : remoteVolumeRef.current,
+          audioContextRef.current.currentTime
+        );
+      }
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.muted = nextDeaf;
+      }
+      return nextDeaf;
+    });
+  };
+
+  const handleVolumeChange = (newVol: number) => {
+    setRemoteVolume(newVol);
+    remoteVolumeRef.current = newVol;
+    if (remoteGainNodeRef.current && audioContextRef.current && !isDeafenedRef.current) {
+      remoteGainNodeRef.current.gain.setValueAtTime(newVol, audioContextRef.current.currentTime);
+    }
+    if (remoteAudioRef.current && !isDeafenedRef.current) {
+      remoteAudioRef.current.volume = Math.min(1.0, newVol);
+    }
+  };
+
+  const unlockAudio = () => {
+    const audioCtx = getOrCreateAudioContext();
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.play().catch(() => {});
+    }
+    setAutoplayBlocked(false);
+  };
+
+  const handleProceedWithoutShield = () => {
+    setShowNoShieldModal(false);
+    setUiMode("discord");
+    unlockAudio();
+  };
+
+  const handleEndCall = () => {
+    if (p2pPcRef.current) p2pPcRef.current.close();
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+    }
+    setCallState("ended");
+    router.push("/call");
+  };
+
+  const handleCopyLink = () => {
+    const url = typeof window !== "undefined" ? window.location.href : "";
+    navigator.clipboard.writeText(url);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2500);
+  };
+
+  // ────────────────────────────────────────────────────────────
+  // 6. Observer Monitor Tap (Only for Optional Forensic View)
   // ────────────────────────────────────────────────────────────
   const stopObserver = useCallback(() => {
     lastEventSeqRef.current = -1;
@@ -729,7 +900,6 @@ export default function CallRoomPage({
     }
     setMonitorConnected(false);
     setVadActive(false);
-    setWindowProgress(0);
     latestFinalUtteranceRef.current = 0;
   }, []);
 
@@ -740,7 +910,6 @@ export default function CallRoomPage({
     setCaptions([]);
     setDetections([]);
     setSpeakerInfo(null);
-    setWindowProgress(0);
 
     let trackToAnalyze: MediaStreamTrack | null = null;
     if (monitorTarget === "remote") {
@@ -867,17 +1036,14 @@ export default function CallRoomPage({
             }
           } else if (data.type === "speaker") {
             setSpeakerInfo(data);
-          } else if (data.type === "window_progress") {
-            setWindowProgress(data.progress_pct || 0);
           }
         } catch {
-          // Ignore parse errors
+          // Ignore
         }
       };
       monitorWsRef.current = ws;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Observer tap error";
-      console.warn(`[VoiceShield Observer] ${msg}`);
       setMonitorError(`${msg} — Two-way voice call remains connected.`);
     }
   }, [monitorTarget, remotePeerId, roomId, stopObserver]);
@@ -891,84 +1057,14 @@ export default function CallRoomPage({
     return () => stopObserver();
   }, [uiMode, monitorActive, monitorTarget, remoteTrackAvailable, startObserver, stopObserver]);
 
-  // ────────────────────────────────────────────────────────────
-  // 6. User Call Actions (Mute, Deafen, Volume, Hangup)
-  // ────────────────────────────────────────────────────────────
-  const toggleMute = () => {
-    if (localStreamRef.current) {
-      const track = localStreamRef.current.getAudioTracks()[0];
-      if (track) {
-        track.enabled = !track.enabled;
-        setIsMuted(!track.enabled);
-      }
-    }
-  };
-
-  const toggleDeafen = () => {
-    const nextDeaf = !isDeafened;
-    setIsDeafened(nextDeaf);
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.muted = nextDeaf;
-    }
-    if (remoteGainNodeRef.current) {
-      remoteGainNodeRef.current.gain.value = nextDeaf ? 0 : remoteVolume;
-    }
-  };
-
-  const handleVolumeChange = (newVol: number) => {
-    setRemoteVolume(newVol);
-    if (remoteAudioRef.current && !isDeafened) {
-      remoteAudioRef.current.volume = Math.min(1.0, newVol);
-    }
-    if (remoteGainNodeRef.current && !isDeafened) {
-      remoteGainNodeRef.current.gain.value = newVol;
-    }
-  };
-
-  const unlockAudio = () => {
-    const audioCtx = getOrCreateAudioContext();
-    if (audioCtx.state === "suspended") {
-      audioCtx.resume();
-    }
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.play().catch(() => {});
-    }
-    setAutoplayBlocked(false);
-  };
-
-  const handleProceedWithoutShield = () => {
-    setShowNoShieldModal(false);
-    setUiMode("discord");
-    unlockAudio();
-  };
-
-  const handleEndCall = () => {
-    if (p2pPcRef.current) p2pPcRef.current.close();
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-    }
-    stopObserver();
-    setCallState("ended");
-    router.push("/call");
-  };
-
-  const handleCopyLink = () => {
-    const url = typeof window !== "undefined" ? window.location.href : "";
-    navigator.clipboard.writeText(url);
-    setCopiedLink(true);
-    setTimeout(() => setCopiedLink(false), 2500);
-  };
-
   const latestDetection = detections.length > 0 ? detections[detections.length - 1] : null;
-  const validDetections = detections.filter((d) => d.window_valid && d.decision !== "ABSTAIN" && d.decision !== "INVALID");
-  const suspiciousWindows = validDetections.filter((d) => d.decision === "SUSPICIOUS");
-  const genuineWindows = validDetections.filter((d) => d.decision === "GENUINE");
-  const uncertainWindows = validDetections.filter((d) => d.decision === "UNCERTAIN");
-  const abstainCount = detections.filter((d) => d.decision === "ABSTAIN").length;
 
   return (
-    <div className="min-h-screen bg-[#1e1f22] text-gray-200 -mx-4 -my-8 p-4 md:p-8 flex flex-col justify-between">
-      {/* Hidden Audio Output Element */}
+    <div
+      onClick={unlockAudio}
+      className="min-h-screen bg-[#1e1f22] text-gray-200 -mx-4 -my-8 p-4 md:p-8 flex flex-col justify-between"
+    >
+      {/* Hidden Audio Output */}
       <audio ref={remoteAudioRef} autoPlay playsInline />
 
       {/* ────────────────────────────────────────────────────────────
@@ -977,7 +1073,6 @@ export default function CallRoomPage({
       {showNoShieldModal && (
         <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-[#2b2d31] border border-amber-500/30 rounded-2xl p-6 sm:p-8 max-w-lg w-full shadow-2xl text-center transform transition-all animate-in fade-in zoom-in-95 duration-200">
-            {/* Warning Shield Icon */}
             <div className="w-16 h-16 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 mx-auto mb-4 flex items-center justify-center text-3xl">
               🛡️
             </div>
@@ -1041,7 +1136,7 @@ export default function CallRoomPage({
             className={`text-[10px] font-semibold px-2.5 py-0.5 rounded-full flex items-center gap-1.5 ${
               callState === "connected"
                 ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                : peerCount >= 2
+                : peerCount >= 2 || remotePeerId
                 ? "bg-sky-500/20 text-sky-400 border border-sky-500/30"
                 : "bg-amber-500/20 text-amber-400 border border-amber-500/30"
             }`}
@@ -1050,15 +1145,15 @@ export default function CallRoomPage({
               className={`w-1.5 h-1.5 rounded-full ${
                 callState === "connected"
                   ? "bg-emerald-400 animate-pulse"
-                  : peerCount >= 2
+                  : peerCount >= 2 || remotePeerId
                   ? "bg-sky-400"
                   : "bg-amber-400"
               }`}
             />
             {callState === "connected"
               ? "Voice Connected"
-              : peerCount >= 2
-              ? "Connecting..."
+              : peerCount >= 2 || remotePeerId
+              ? "Connecting Audio..."
               : "Waiting for Peer"}
           </span>
         </div>
@@ -1071,15 +1166,12 @@ export default function CallRoomPage({
             Peers: {peerCount}/2
           </span>
 
-          {/* Toggle between Clean Discord UI and Forensic Shield View (if backend available) */}
           {isBackendAvailable && (
             <div className="flex items-center bg-[#1e1f22] p-1 rounded-lg border border-gray-800 text-[11px]">
               <button
                 onClick={() => setUiMode("discord")}
                 className={`px-3 py-1 rounded-md transition-all ${
-                  uiMode === "discord"
-                    ? "bg-[#5865f2] text-white font-semibold"
-                    : "text-gray-400 hover:text-white"
+                  uiMode === "discord" ? "bg-[#5865f2] text-white font-semibold" : "text-gray-400 hover:text-white"
                 }`}
               >
                 Voice Room
@@ -1087,9 +1179,7 @@ export default function CallRoomPage({
               <button
                 onClick={() => setUiMode("shield")}
                 className={`px-3 py-1 rounded-md transition-all ${
-                  uiMode === "shield"
-                    ? "bg-cyan-600 text-white font-semibold"
-                    : "text-gray-400 hover:text-white"
+                  uiMode === "shield" ? "bg-cyan-600 text-white font-semibold" : "text-gray-400 hover:text-white"
                 }`}
               >
                 Shield Diagnostics
@@ -1105,14 +1195,12 @@ export default function CallRoomPage({
       <main className="my-6 flex-1 flex flex-col justify-center">
         {uiMode === "discord" ? (
           /* ════════════════════════════════════════════════════════════
-             DISCORD-STYLE VOICE ROOM UI (Non-VoiceShield)
+             DISCORD-STYLE VOICE ROOM UI
              ════════════════════════════════════════════════════════════ */
           <div className="max-w-4xl w-full mx-auto space-y-6">
-            {/* 2-Caller Voice Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Local User Card (You) */}
+              {/* Local Caller Card (You) */}
               <div className="bg-[#2b2d31] rounded-2xl p-8 border border-[#1e1f22] shadow-xl flex flex-col items-center justify-center relative min-h-[280px]">
-                {/* Speaking Ring Avatar */}
                 <div className="relative mb-4">
                   <div
                     className={`w-28 h-28 rounded-full bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-3xl font-bold text-white shadow-2xl transition-all duration-150 ${
@@ -1123,7 +1211,6 @@ export default function CallRoomPage({
                   >
                     YOU
                   </div>
-                  {/* Mic mute indicator badge on avatar */}
                   <div
                     className={`absolute bottom-0 right-0 w-8 h-8 rounded-full flex items-center justify-center text-xs shadow-md border-2 border-[#2b2d31] ${
                       isMuted ? "bg-[#da373c] text-white" : "bg-[#23a55a] text-white"
@@ -1142,12 +1229,12 @@ export default function CallRoomPage({
                   </p>
                 </div>
 
-                {/* Animated Audio Waveform Bars */}
+                {/* Animated Waveform Equalizer Bars */}
                 <div className="flex items-center gap-1.5 mt-5 h-6">
                   {[0.4, 0.8, 1, 0.7, 0.3].map((factor, i) => (
                     <div
                       key={i}
-                      className="w-1.5 bg-[#23a55a] rounded-full transition-all duration-75"
+                      className="w-1.5 bg-[#23a55a] rounded-full transition-all duration-100"
                       style={{
                         height: isLocalSpeaking ? `${Math.max(4, localAudioLevel * factor * 0.25)}px` : "4px",
                         opacity: isLocalSpeaking ? 1 : 0.3,
@@ -1157,11 +1244,11 @@ export default function CallRoomPage({
                 </div>
               </div>
 
-              {/* Remote Peer Card */}
+              {/* Remote Caller Card */}
               <div className="bg-[#2b2d31] rounded-2xl p-8 border border-[#1e1f22] shadow-xl flex flex-col items-center justify-center relative min-h-[280px]">
-                {callState === "connected" && remoteTrackAvailable ? (
+                {/* Show Remote Peer if in room OR connected */}
+                {peerCount >= 2 || remotePeerId || callState === "connected" ? (
                   <>
-                    {/* Speaking Ring Avatar */}
                     <div className="relative mb-4">
                       <div
                         className={`w-28 h-28 rounded-full bg-gradient-to-tr from-cyan-600 to-blue-600 flex items-center justify-center text-3xl font-bold text-white shadow-2xl transition-all duration-150 ${
@@ -1182,16 +1269,20 @@ export default function CallRoomPage({
                         Remote Caller <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[#1e1f22] text-cyan-400">Caller B</span>
                       </h3>
                       <p className="text-xs text-gray-400 mt-1 font-mono">
-                        {isRemoteSpeaking ? "Speaking..." : "Connected · Listening"}
+                        {isRemoteSpeaking
+                          ? "Speaking..."
+                          : callState === "connected"
+                          ? "Connected · Listening"
+                          : "Connecting Voice Stream..."}
                       </p>
                     </div>
 
-                    {/* Animated Audio Waveform Bars */}
+                    {/* Animated Waveform Equalizer Bars */}
                     <div className="flex items-center gap-1.5 mt-5 h-6">
                       {[0.5, 0.9, 1, 0.8, 0.4].map((factor, i) => (
                         <div
                           key={i}
-                          className="w-1.5 bg-[#23a55a] rounded-full transition-all duration-75"
+                          className="w-1.5 bg-[#23a55a] rounded-full transition-all duration-100"
                           style={{
                             height: isRemoteSpeaking ? `${Math.max(4, remoteAudioLevel * factor * 0.25)}px` : "4px",
                             opacity: isRemoteSpeaking ? 1 : 0.3,
@@ -1200,7 +1291,7 @@ export default function CallRoomPage({
                       ))}
                     </div>
 
-                    {/* Remote Volume Slider */}
+                    {/* Remote Volume Control Slider */}
                     <div className="mt-4 flex items-center gap-2 text-xs text-gray-400 w-48">
                       <span className="text-[10px]">Vol:</span>
                       <input
@@ -1238,7 +1329,6 @@ export default function CallRoomPage({
               </div>
             </div>
 
-            {/* Direct Voice Mode Status Pill */}
             <div className="text-center">
               <span className="text-[11px] font-mono text-gray-500 bg-[#2b2d31] px-4 py-1.5 rounded-full border border-gray-800">
                 Direct P2P Voice Stream · High-Definition Opus 48kHz
@@ -1247,7 +1337,7 @@ export default function CallRoomPage({
           </div>
         ) : (
           /* ════════════════════════════════════════════════════════════
-             SECURITY DIAGNOSTICS VIEW (Only when backend is active & enabled)
+             SECURITY DIAGNOSTICS VIEW
              ════════════════════════════════════════════════════════════ */
           <div className="space-y-6 max-w-7xl mx-auto w-full">
             <div className="rounded-2xl border border-gray-800/80 bg-gray-950/60 p-5 shadow-lg">
@@ -1299,9 +1389,7 @@ export default function CallRoomPage({
                 </div>
               )}
 
-              {/* Multi-Signal Observer Panels */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {/* Speech Detection */}
                 <div className="p-4 rounded-xl bg-gray-900/60 border border-gray-800/60">
                   <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
                     Target Speech Detection ({monitorTarget === "remote" ? "Remote Peer" : "Local Mic"})
@@ -1316,7 +1404,6 @@ export default function CallRoomPage({
                   </div>
                 </div>
 
-                {/* Live Captions */}
                 <div className="p-4 rounded-xl bg-gray-900/60 border border-gray-800/60">
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
@@ -1352,15 +1439,11 @@ export default function CallRoomPage({
                   </div>
                 </div>
 
-                {/* Anti-Spoof Evidence */}
                 <div className="p-4 rounded-xl bg-gray-900/60 border border-gray-800/60">
                   <div className="flex items-center justify-between mb-3">
                     <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
                       Anti-Spoof Evidence (Spectra-AASIST)
                     </h3>
-                    <span className="text-[10px] text-gray-500 font-mono">
-                      Window Cadence: 4.04s
-                    </span>
                   </div>
 
                   <div className={`mb-3 p-3 rounded-xl border ${
@@ -1377,24 +1460,8 @@ export default function CallRoomPage({
                       {protectionDecision ? `${protectionDecision.decision} (${protectionDecision.risk_level} RISK) — ${protectionDecision.reason}` : "AWAITING SPEECH WINDOW (4.04s)"}
                     </span>
                   </div>
-
-                  {latestDetection && (
-                    <div className="grid grid-cols-2 gap-2 bg-gray-950 p-2.5 rounded-lg border border-gray-800/60 font-mono text-[11px]">
-                      <div>
-                        <span className="text-gray-500">Spoof Score: </span>
-                        <span className="text-gray-300">{latestDetection.spoof_score.toFixed(4)}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">Decision: </span>
-                        <span className={latestDetection.decision === "SUSPICIOUS" ? "text-red-400 font-bold" : "text-emerald-400 font-bold"}>
-                          {latestDetection.decision}
-                        </span>
-                      </div>
-                    </div>
-                  )}
                 </div>
 
-                {/* Speaker Biometrics */}
                 <div className="p-4 rounded-xl bg-gray-900/60 border border-gray-800/60">
                   <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
                     Speaker Evidence (ECAPA-TDNN)
